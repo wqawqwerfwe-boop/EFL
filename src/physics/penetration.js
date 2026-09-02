@@ -1,5 +1,12 @@
 import * as THREE from 'three';
 
+import {
+  SURFACE as CANON,
+  SURFACE_BALLISTICS,
+  SURFACE_NAMES,
+  SURFACE_THICKNESS,
+} from '../core/surfaces.js';
+
 /*
  * Escape from Larpov - ballistics and penetration solver.
  *
@@ -10,45 +17,24 @@ import * as THREE from 'three';
  * Ни clone(), ни new Vector3 внутри solve(). Ни одного шаблонного литерала.
  */
 
-/* Порядок совпадает с SURFACE_ORDER из world/maps/_kit.js. Менять только синхронно. */
-export const SURFACE_ORDER = [
-  'concrete',
-  'plaster',
-  'metal',
-  'wood',
-  'glass',
-  'dirt',
-  'sand',
-  'fabric',
-  'foliage',
-  'rubber',
-  'water',
-  'flesh',
-];
+/*
+ * Порядок поверхностей, баллистика и толщины приходят из src/core/surfaces.js.
+ * Локальных таблиц здесь больше нет. Раньше локальный SURFACE_ORDER шёл в
+ * другом порядке, чем physics/surfaces.js: индекс, записанный физикой в
+ * треугольник, читался решателем как другой материал (11 - штукатурка там,
+ * плоть здесь). Единое индексное пространство теперь одно на весь проект.
+ */
+export const SURFACE_ORDER = SURFACE_NAMES;
+
+const SURF_N = SURFACE_ORDER.length;
 
 /*
- * Баллистика поверхностей.
+ * Баллистика поверхностей (значения живут в src/core/surfaces.js).
  *   cost - сколько единиц пробивной способности съедает один метр материала
  *   ric  - базовый шанс рикошета
  *   ang  - критический угол в градусах, ниже которого возможен рикошет
  *   pass - доля урона, сохраняемая пулей после пробития
  */
-const SURFACE_RAW = {
-  concrete: { cost: 42, ric: 0.06, ang: 14, pass: 0.3 },
-  plaster: { cost: 18, ric: 0.02, ang: 10, pass: 0.62 },
-  metal: { cost: 34, ric: 0.22, ang: 26, pass: 0.45 },
-  wood: { cost: 12, ric: 0.02, ang: 9, pass: 0.8 },
-  glass: { cost: 4, ric: 0.01, ang: 6, pass: 0.95 },
-  dirt: { cost: 48, ric: 0.02, ang: 11, pass: 0.15 },
-  sand: { cost: 52, ric: 0.01, ang: 9, pass: 0.1 },
-  fabric: { cost: 6, ric: 0, ang: 0, pass: 0.92 },
-  foliage: { cost: 3, ric: 0, ang: 0, pass: 0.97 },
-  rubber: { cost: 20, ric: 0.04, ang: 16, pass: 0.55 },
-  water: { cost: 30, ric: 0.1, ang: 8, pass: 0.35 },
-  flesh: { cost: 8, ric: 0, ang: 0, pass: 0.75 },
-};
-
-const SURF_N = SURFACE_ORDER.length;
 
 /* Struct-of-Arrays: в горячем цикле читаются только типизированные массивы. */
 export const SURFACE = {
@@ -61,18 +47,15 @@ export const SURFACE = {
 };
 
 for (let i = 0; i < SURF_N; i++) {
-  const s = SURFACE_RAW[SURFACE_ORDER[i]];
+  const s = SURFACE_BALLISTICS[SURFACE_ORDER[i]];
   SURFACE.cost[i] = s.cost;
   SURFACE.ric[i] = s.ric;
   SURFACE.ang[i] = Math.cos((90 - s.ang) * Math.PI / 180);
   SURFACE.pass[i] = s.pass;
 }
 
-const SURFACE_INDEX = Object.create(null);
-for (let i = 0; i < SURF_N; i++) SURFACE_INDEX[SURFACE_ORDER[i]] = i;
-
 export function surfaceIndex(name) {
-  const i = SURFACE_INDEX[name];
+  const i = CANON[name];
   return i === undefined ? 0 : i;
 }
 
@@ -285,17 +268,23 @@ function buildCast(phys) {
 
 /*
  * Номинальная толщина преграды в метрах для расчёта цены пробития.
- * Порядок строго по SURFACE_ORDER.
+ * Значения канонические: src/core/surfaces.js, порядок - SURFACE_ORDER.
  */
-const THICK_RAW = [0.3, 0.12, 0.05, 0.08, 0.01, 0.5, 0.5, 0.02, 0.05, 0.1, 1, 0.25];
 const PEN_SCALE = 3;
 
 const THICK = new Float32Array(SURF_N);
 const PEN_COST = new Float32Array(SURF_N);
 for (let i = 0; i < SURF_N; i++) {
-  THICK[i] = THICK_RAW[i];
-  PEN_COST[i] = SURFACE.cost[i] * THICK_RAW[i] * PEN_SCALE;
+  THICK[i] = SURFACE_THICKNESS[i];
+  PEN_COST[i] = SURFACE.cost[i] * THICK[i] * PEN_SCALE;
 }
+
+/*
+ * Индекс плоти. Раньше в solve() стояла константа 11, верная только для
+ * старого локального порядка. В каноническом пространстве плоть - 19,
+ * а 11 - песок, то есть сквозное пробитие тела считалось по песку.
+ */
+const FLESH = CANON.flesh;
 
 export class PenetrationSolver {
   constructor(physics, ctx) {
@@ -508,12 +497,12 @@ export class PenetrationSolver {
         this._emit('bullet:impact', imp);
 
         /* Сквозное пробитие тела. */
-        const fleshCost = PEN_COST[11];
+        const fleshCost = PEN_COST[FLESH];
         if (pen <= fleshCost || imp.fragment) return imp;
         pen -= fleshCost;
-        damage = dealt * SURFACE.pass[11];
-        this._pos.set(hit.point.x + dx * (THICK[11] + SKIN), hit.point.y + dy * (THICK[11] + SKIN), hit.point.z + dz * (THICK[11] + SKIN));
-        range -= THICK[11] + SKIN;
+        damage = dealt * SURFACE.pass[FLESH];
+        this._pos.set(hit.point.x + dx * (THICK[FLESH] + SKIN), hit.point.y + dy * (THICK[FLESH] + SKIN), hit.point.z + dz * (THICK[FLESH] + SKIN));
+        range -= THICK[FLESH] + SKIN;
         this._from.set(this._pos.x, this._pos.y, this._pos.z);
         continue;
       }
