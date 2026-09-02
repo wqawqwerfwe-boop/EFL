@@ -1,4 +1,5 @@
 import buildCustoms, { customsMeta } from './customs.js'
+import buildFactory, { factoryMeta } from './factory.js'
 import buildWoods, { woodsMeta } from './woods.js'
 import buildInterchange, { interchangeMeta } from './interchange.js'
 import buildLab, { labMeta } from './lab.js'
@@ -13,6 +14,7 @@ import buildLab, { labMeta } from './lab.js'
 /* Таблица билдеров: id карты -> функция построения. */
 const BUILDERS = {
 	customs: buildCustoms,
+	factory: buildFactory,
 	woods: buildWoods,
 	interchange: buildInterchange,
 	lab: buildLab,
@@ -21,6 +23,7 @@ const BUILDERS = {
 /* Таблица метаданных: id карты -> meta из файла карты. */
 const META = {
 	customs: customsMeta,
+	factory: factoryMeta,
 	woods: woodsMeta,
 	interchange: interchangeMeta,
 	lab: labMeta,
@@ -29,8 +32,9 @@ const META = {
 /*
  * Порядок показа в меню рейда и порядок прогрессии по уровню.
  * Таможня идёт первой: minLevel 1, стартовая локация без карты доступа.
+ * Завод сразу за ней: тоже minLevel 1, но короткий рейд на 20 минут.
  */
-const ORDER = ['customs', 'woods', 'interchange', 'lab']
+const ORDER = ['customs', 'factory', 'woods', 'interchange', 'lab']
 
 export const MAP_IDS = ORDER.slice()
 export const MAP_META = META
