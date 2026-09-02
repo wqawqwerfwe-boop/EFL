@@ -1,19 +1,16 @@
 import { EFL } from '../core/config.js';
+import { SURFACE_BALLISTICS, SURFACE_NAMES } from '../core/surfaces.js';
 
-export const SURFACE_BALLISTICS = {
-  concrete: { cost: 42, ric: 0.06, ang: 14, pass: 0.3 },
-  plaster: { cost: 18, ric: 0.02, ang: 10, pass: 0.62 },
-  metal: { cost: 34, ric: 0.22, ang: 26, pass: 0.45 },
-  wood: { cost: 12, ric: 0.02, ang: 9, pass: 0.8 },
-  glass: { cost: 4, ric: 0.01, ang: 6, pass: 0.95 },
-  dirt: { cost: 48, ric: 0.02, ang: 11, pass: 0.15 },
-  sand: { cost: 52, ric: 0.01, ang: 9, pass: 0.1 },
-  fabric: { cost: 6, ric: 0, ang: 0, pass: 0.92 },
-  foliage: { cost: 3, ric: 0, ang: 0, pass: 0.97 },
-  rubber: { cost: 20, ric: 0.04, ang: 16, pass: 0.55 },
-  water: { cost: 30, ric: 0.1, ang: 8, pass: 0.35 },
-  flesh: { cost: 8, ric: 0, ang: 0, pass: 0.75 },
-};
+/*
+ * Surface ballistics live in src/core/surfaces.js.
+ *
+ * This module used to declare its own twelve-entry copy, and because the
+ * Float32Array lanes in init() were keyed off Object.keys() of that literal,
+ * items ended up with a third index space that agreed with neither physics nor
+ * the penetration solver. Re-exported here so existing importers of
+ * items/index.js keep resolving.
+ */
+export { SURFACE_BALLISTICS };
 
 export const ITEMS = Object.create(null);
 const def = (o) => (ITEMS[o.id] = o);
@@ -207,7 +204,13 @@ export class ItemsSystem {
       this.loot[kind] = { ids, cum, total: acc };
     }
 
-    this.surfaceKeys = Object.keys(SURFACE_BALLISTICS);
+    /*
+     * Lane order IS the canonical surface order. Keying this off
+     * Object.keys() of a local literal is what gave items its own index
+     * space; SURFACE_NAMES makes surfaceSlot() agree with physics and the
+     * penetration solver by construction.
+     */
+    this.surfaceKeys = SURFACE_NAMES.slice();
     this.sCost = new Float32Array(this.surfaceKeys.length);
     this.sRic = new Float32Array(this.surfaceKeys.length);
     this.sAng = new Float32Array(this.surfaceKeys.length);
