@@ -1,5 +1,6 @@
 import { EFL } from '../core/config.js'
 import { applyInventoryPersistence } from '../inventory/persistence.js'
+import { armorMaterial, ensureArmorInstance, isArmorDef } from '../items/index.js'
 
 const SKEY = 'efl_ow_v1'
 
@@ -9,11 +10,14 @@ const SKEY = 'efl_ow_v1'
  * v1 — первая сборка: {p, inv, slots} без поля версии (inv/slots писались, но
  *      никогда не читались — тайник умирал на каждом F5).
  * v2 — то же плюс v, и с честной раскладкой inv/slots при загрузке.
+ * v3 — в кортеже предмета появился durMax (индекс 12). Ремонт у торговца
+ *      навсегда срезает потолок ресурса, и без этого поля вещь возвращалась с
+ *      перезагрузки заводской: dur сохранялся, а потолок — нет.
  *
- * Старше — миграция (структура кортежей не менялась). Новее — отказ: «починить»
- * сейв из будущей сборки нельзя, можно только не трогать его.
+ * Старше — миграция (структура кортежей только дополнялась). Новее — отказ:
+ * «починить» сейв из будущей сборки нельзя, можно только не трогать его.
  */
-const SAVE_VERSION = 2
+const SAVE_VERSION = 3
 
 /** id блокирующей плашки — одна на документ, без стопки дублей. */
 const WARN_ID = 'efl-save-fatal'
@@ -37,6 +41,37 @@ const TRADERS = [
 	{ id:'jaeger',     n:'Егерь',      buys:['food','barter'],            cur:'rub' },
 	{ id:'ref',        n:'Смотритель', buys:['barter'],                  cur:'rub' },
 ]
+
+/**
+ * РЕМОНТ. Мастер возвращает ресурс, но каждый заход навсегда съедает часть
+ * потолка: настоящая цена ремонта не в рублях, а в том, что вещь становится
+ * расходником. Дорогой мастер бережёт плиту, дешёвый добивает её за пять
+ * заходов.
+ *
+ *   kinds    что берёт в работу; 'armor' — всё, что проходит isArmorDef(),
+ *            '*' — Скупщик, он берётся за любую рухлядь
+ *   degrade  базовая доля durMax, уходящая безвозвратно
+ *   rate     наценка за работу
+ *   cur      валюта расчёта
+ */
+const REPAIRERS = Object.freeze({
+	prapor: Object.freeze({ kinds: Object.freeze(['weapon', 'mag']), degrade: 0.12, rate: 0.9, cur: 'rub' }),
+	skier: Object.freeze({ kinds: Object.freeze(['weapon', 'armor']), degrade: 0.13, rate: 0.95, cur: 'eur' }),
+	peacekeeper: Object.freeze({ kinds: Object.freeze(['weapon', 'armor']), degrade: 0.07, rate: 1.35, cur: 'usd' }),
+	mechanic: Object.freeze({ kinds: Object.freeze(['weapon', 'mag', 'mod']), degrade: 0.06, rate: 1.25, cur: 'rub' }),
+	ragman: Object.freeze({ kinds: Object.freeze(['armor', 'rig', 'backpack']), degrade: 0.1, rate: 1, cur: 'rub' }),
+	fence: Object.freeze({ kinds: Object.freeze(['*']), degrade: 0.15, rate: 0.75, cur: 'rub' }),
+})
+
+/* Границы из брифа: за один заход теряется 5..15 процентов durMax. */
+const DEGRADE_MIN = 0.05
+const DEGRADE_MAX = 0.15
+/* Насколько один уровень лояльности улучшает качество работы. */
+const REPAIR_LL_QUALITY = 0.09
+/* Полное восстановление убитой вещи стоит эту долю её цены. */
+const REPAIR_RATE = 0.45
+/* Запасной курс, если валюту вырезали из таблицы предметов. */
+const FX_FALLBACK = Object.freeze({ usd: 145, eur: 160 })
 
 /** Контейнеры тела. Восстанавливаются ПЕРВЫМИ: они создают сетки in:<uid>. */
 const CONTAINER_SLOTS = ['secure', 'rig', 'backpack']
@@ -117,6 +152,186 @@ export class MetaSystem {
 		return true
 	}
 
+	/* ---------- ремонт ---------- */
+
+	/** Мастер по id, либо null: не каждый торговец берётся за работу. */
+	_repairer(traderId) {
+		const r = REPAIRERS[traderId]
+		return r === undefined ? null : r
+	}
+
+	/**
+	 * Курс валюты мастера в рублях.
+	 *
+	 * Цены в таблице предметов рублёвые, а Миротворец считает в долларах: без
+	 * пересчёта ремонт у него стоил бы в 145 раз дороже. Курс берётся из самой
+	 * таблицы (rub/usd/eur — обычные предметы со своей ценой), чтобы в проекте не
+	 * появилось второе место, где живёт курс.
+	 */
+	_fx(cur) {
+		if (cur === 'rub') return 1
+		const p = Number(this.items.price(cur))
+		if (Number.isFinite(p) && p > 1) return p
+		return FX_FALLBACK[cur] ?? 1
+	}
+
+	/**
+	 * Ресурс экземпляра: [dur, durMax].
+	 *
+	 * Броня добивается ensureArmorInstance() — предметы из стартового набора и из
+	 * доармурных сейвов приходят вообще без полей. Для оружия потолком служит
+	 * заводское d.dur. Ноль означает «ремонтировать нечего».
+	 */
+	_durability(it, d) {
+		if (isArmorDef(d)) ensureArmorInstance(it, d)
+		const maxRaw = Number(it.durMax ?? d.durMax ?? d.dur ?? 0)
+		const durMax = Number.isFinite(maxRaw) && maxRaw > 0 ? maxRaw : 0
+		const curRaw = Number(it.dur ?? durMax)
+		const dur = Number.isFinite(curRaw) ? Math.max(0, Math.min(durMax, curRaw)) : durMax
+		return [dur, durMax]
+	}
+
+	/**
+	 * Смета ремонта. Ничего не меняет — это то, что экран торговца показывает до
+	 * нажатия, и то, на чём считает repair().
+	 *
+	 * @param {number} uid uid экземпляра в инвентаре
+	 * @param {string} traderId id мастера
+	 * @returns {{ok:boolean,reason?:string,cost?:number,currency?:string,
+	 *   dur?:number,durMax?:number,durAfter?:number,durMaxAfter?:number,
+	 *   restored?:number,degrade?:number,loyalty?:number}}
+	 */
+	repairQuote(uid, traderId) {
+		const rep = this._repairer(traderId)
+		if (!rep) return { ok: false, reason: 'trader', uid, traderId }
+
+		const it = this.inv?.get(uid) ?? null
+		if (!it) return { ok: false, reason: 'item', uid, traderId }
+		const d = this.items.get(it.id)
+		if (!d) return { ok: false, reason: 'item', uid, traderId }
+
+		/* Вид работы: броня опознаётся по схеме (armorClass + zones), а не по
+		 * слоту, иначе шлем и разгрузка с плитами попали бы в разные списки. */
+		const armor = isArmorDef(d)
+		const type = String(d.t ?? '')
+		const kind = armor ? 'armor' : type
+		const kinds = rep.kinds
+		if (kinds.indexOf('*') < 0 && kinds.indexOf(kind) < 0 && kinds.indexOf(type) < 0) {
+			return { ok: false, reason: 'kind', uid, traderId, kind }
+		}
+
+		const pair = this._durability(it, d)
+		const dur = pair[0]
+		const durMax = pair[1]
+		if (durMax <= 0) return { ok: false, reason: 'noDurability', uid, traderId, itemId: it.id }
+		if (durMax - dur <= 0.01) return { ok: false, reason: 'intact', uid, traderId, itemId: it.id, dur, durMax }
+
+		const ll = this.loyalty(traderId)
+
+		/* Сколько потолка уйдёт навсегда: качество мастера, множитель материала
+		 * (керамика после трещины уже не та плита) и скидка за лояльность. Итог
+		 * зажат в мандатные 5..15 процентов. */
+		const mat = armor ? armorMaterial(d.material) : null
+		const wearRaw = Number(mat?.repairDegradation)
+		const wear = Number.isFinite(wearRaw) && wearRaw > 0 ? wearRaw : 1
+		let degrade = rep.degrade * wear * (1 - (ll - 1) * REPAIR_LL_QUALITY)
+		if (degrade < DEGRADE_MIN) degrade = DEGRADE_MIN
+		if (degrade > DEGRADE_MAX) degrade = DEGRADE_MAX
+
+		/* Новый потолок и полное восстановление под него. Ресурс зажимается
+		 * потолком, поэтому ремонт почти целой вещи — осознанно плохая сделка. */
+		const durMaxAfter = Math.max(1, Math.round(durMax * (1 - degrade) * 100) / 100)
+		const durAfter = durMaxAfter
+		const restored = Math.max(0, Math.round((durAfter - dur) * 100) / 100)
+
+		/* Цена: доля цены вещи за восстановленный ресурс, наценка мастера и
+		 * скидка за уровень лояльности той же формы, что в buyPrice(). */
+		const base = Number(this.items.price(it.id))
+		const price = Number.isFinite(base) && base > 0 ? base : 0
+		const share = restored / durMax
+		const rub = price * share * REPAIR_RATE * rep.rate * (1.25 - ll * 0.05)
+		const costRub = Math.max(1, Math.round(rub))
+		const cost = Math.max(1, Math.round(costRub / this._fx(rep.cur)))
+
+		return {
+			ok: true, uid, traderId, itemId: it.id, kind,
+			currency: rep.cur, cost, costRub, loyalty: ll,
+			dur, durMax, durAfter, durMaxAfter, restored, degrade,
+			material: armor ? d.material ?? null : null,
+		}
+	}
+
+	/** Цена ремонта в валюте мастера, 0 — работать не станет. */
+	repairCost(uid, traderId) {
+		const q = this.repairQuote(uid, traderId)
+		return q.ok ? q.cost : 0
+	}
+
+	canRepair(uid, traderId) {
+		return this.repairQuote(uid, traderId).ok
+	}
+
+	/** Кто возьмётся за эту вещь, от самого дешёвого к самому дорогому. */
+	repairTraders(uid) {
+		const out = []
+		for (const id in REPAIRERS) {
+			const q = this.repairQuote(uid, id)
+			if (q.ok) out.push(q)
+		}
+		out.sort((a, b) => a.costRub - b.costRub)
+		return out
+	}
+
+	/**
+	 * РЕМОНТ. Восстанавливает dur под потолок и навсегда срезает сам потолок.
+	 *
+	 * Ресурс живёт в экземпляре, а не в определении предмета, поэтому durMax
+	 * пишется прямо в него и уезжает в сейв (кортеж v3, индекс 12).
+	 *
+	 * @param {number} uid uid экземпляра
+	 * @param {string} traderId id мастера
+	 * @returns {object} смета с applied: true, либо {ok:false, reason}
+	 */
+	repair(uid, traderId) {
+		/* Услуги торговцев существуют только вне рейда: в бою мастера нет. */
+		const raid = this.ctx?.peek ? this.ctx.peek('raid') : null
+		if (raid?.active) return { ok: false, reason: 'raid', uid, traderId }
+
+		const q = this.repairQuote(uid, traderId)
+		if (!q.ok) return q
+		if (this.money(q.currency) < q.cost) {
+			return { ok: false, reason: 'funds', uid, traderId, currency: q.currency, cost: q.cost }
+		}
+		if (!this.spend(q.currency, q.cost)) {
+			return { ok: false, reason: 'funds', uid, traderId, currency: q.currency, cost: q.cost }
+		}
+
+		const it = this.inv.get(uid)
+		if (!it) {
+			/* Вещь исчезла между сметой и оплатой — деньги назад. */
+			this.P.money[q.currency] += q.cost
+			return { ok: false, reason: 'item', uid, traderId }
+		}
+
+		it.durMax = q.durMaxAfter
+		it.dur = q.durAfter
+
+		/* Ремонт — это оборот у мастера: он двигает и репутацию, и порог
+		 * следующего уровня лояльности, ровно как покупка в deal(). */
+		this.P.spent[traderId] = (this.P.spent[traderId] ?? 0) + q.costRub
+		this.P.rep[traderId] = Math.min(1, (this.P.rep[traderId] ?? 0) + q.costRub / 4000000)
+		this._dirty = true
+
+		const out = Object.assign({}, q, { applied: true, loyaltyAfter: this.loyalty(traderId) })
+		/* Своего события ремонт не заводит: сделка идёт документированным
+		 * trader:deal, изменение вещи — inv:changed. */
+		this.ctx?.events?.emit('trader:deal', {
+			traderId, kind: 'repair', sum: q.cost, currency: q.currency, uid, itemId: q.itemId,
+		})
+		this.ctx?.events?.emit('inv:changed', { reason: 'repair', weight: this.inv.weight() })
+		return out
+	}
+
 	/* ---------- страховка ---------- */
 	insureCost(uid) { return Math.round(this.items.price(this.inv.get(uid).id) * 0.08) }
 	insure(uid) {
@@ -190,7 +405,9 @@ export class MetaSystem {
 		return JSON.stringify({
 			v: SAVE_VERSION,
 			p: this.P,
-			inv: this.inv.all.map((i) => [i.uid, i.id, i.n, i.path, i.x, i.y, i.rot, i.mag, i.nm, i.am, i.dur, i.mods]),
+			/* durMax идёт последним (индекс 12): ремонт срезает потолок навсегда, и
+			 * без него плита возвращалась с перезагрузки заводской. */
+			inv: this.inv.all.map((i) => [i.uid, i.id, i.n, i.path, i.x, i.y, i.rot, i.mag, i.nm, i.am, i.dur, i.mods, i.durMax]),
 			slots: [...this.inv.slots],
 		})
 	}
@@ -262,7 +479,7 @@ export class MetaSystem {
 		const v = Math.max(1, Math.round(Number(d.v ?? 1)) || 1)
 		if (v > SAVE_VERSION) {
 			/* Сейв из более новой сборки. Разобрать его частично — тихо потерять
-			 * непонятные нам данные, а потом затереть их своим v2. Поэтому
+			 * непонятные нам данные, а потом затереть их своим v3. Поэтому
 			 * профиль остаётся дефолтным, а запись — разоруженной. */
 			this._saveBlocked = true
 			console.warn('[meta] отказ загружать сейв версии ' + v + ' (поддерживается ' + SAVE_VERSION + ')')
@@ -330,6 +547,9 @@ export class MetaSystem {
 				uid: t[0], id: t[1], n: t[2], path: t[3],
 				x: t[4], y: t[5], rot: t[6], mag: t[7],
 				nm: t[8], am: t[9], dur: t[10], mods: t[11],
+				/* v1/v2 не знали про потолок — там будет undefined, и его добьёт
+				 * ensureArmorInstance() из заводского определения. */
+				durMax: t[12],
 			}
 			if (rec.uid == null || rec.id == null) continue
 			recs.set(rec.uid, rec)
@@ -352,6 +572,14 @@ export class MetaSystem {
 				nm: rec.nm, am: rec.am, dur: rec.dur, mods: rec.mods,
 			})
 			if (!it) return false
+			/* Потолок ресурса — свойство экземпляра, а inventory/persistence.js про
+			 * броню намеренно ничего не знает: досыпаем здесь и зажимаем dur, чтобы
+			 * отремонтированная вещь не «выросла» обратно. */
+			const dm = Number(rec.durMax)
+			if (Number.isFinite(dm) && dm > 0) {
+				it.durMax = dm
+				if (typeof it.dur === 'number' && it.dur > dm) it.dur = dm
+			}
 			done.add(rec.uid)
 			return true
 		}
