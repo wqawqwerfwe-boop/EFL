@@ -6,12 +6,12 @@ const SKEY = 'efl_ow_v1'
 /**
  * Версия payload'а сейва.
  *
- * v1 — то, что писала первая сборка: {p, inv, slots} без поля версии.
- * v2 — то же плюс v, и с честным восстановлением inv/slots при загрузке.
+ * v1 — первая сборка: {p, inv, slots} без поля версии (inv/slots писались, но
+ *      никогда не читались — тайник умирал на каждом F5).
+ * v2 — то же плюс v, и с честной раскладкой inv/slots при загрузке.
  *
- * Всё, что старше — миграция (структура кортежей не менялась). Всё, что
- * новее — отказ: «починить» сейв из будущей сборки нельзя, можно только не
- * трогать его.
+ * Старше — миграция (структура кортежей не менялась). Новее — отказ: «починить»
+ * сейв из будущей сборки нельзя, можно только не трогать его.
  */
 const SAVE_VERSION = 2
 
@@ -38,7 +38,7 @@ const TRADERS = [
 	{ id:'ref',        n:'Смотритель', buys:['barter'],                  cur:'rub' },
 ]
 
-/** Контейнеры тела. Экипируются ПЕРВЫМИ: это они создают сетки in:<uid>. */
+/** Контейнеры тела. Восстанавливаются ПЕРВЫМИ: они создают сетки in:<uid>. */
 const CONTAINER_SLOTS = ['secure', 'rig', 'backpack']
 
 export class MetaSystem {
@@ -51,16 +51,16 @@ export class MetaSystem {
 		this.inv = ctx.get('inventory')
 		this.rng = ctx.rng.fork('meta')
 
-		/* clearAll/restore/commitRestore живут в inventory/persistence.js —
-		 * модель предметов не знает про формат сейва. Вызов идемпотентен. */
+		/* clearAll/restore/commitRestore живут в inventory/persistence.js: модель
+		 * предметов не должна знать про формат сейва. Вызов идемпотентен. */
 		applyInventoryPersistence()
 
 		this.P = this._fresh()
 		this._saveT = 0
 		this._dirty = false
-		/* Запись сломана (квота, приватный режим Safari, отказ загружать чужую
-		 * версию). Автосейв выключается до явного «ПОВТОРИТЬ» игроком: иначе
-		 * исключение прилетает в игровой кадр каждые 8 секунд. */
+		/* Запись сломана (квота, приватный режим, сейв из будущего). Автосейв
+		 * разоружается до явного «ПОВТОРИТЬ»: иначе исключение прилетает в игровой
+		 * кадр каждые 8 секунд. */
 		this._saveBlocked = false
 		this.load()
 
@@ -198,12 +198,11 @@ export class MetaSystem {
 	/**
 	 * Запись профиля. Провал НЕ глотается.
 	 *
-	 * Раньше здесь стоял console.warn: setItem() бросал по квоте, игра ехала
-	 * дальше как будто всё хорошо, и игрок узнавал об утрате тайника только
-	 * после F5. Теперь любой отказ поднимает блокирующую плашку и пробрасывается
-	 * наружу.
+	 * Раньше здесь был console.warn: setItem() бросал по квоте, игра ехала дальше
+	 * с видом, что всё сохранено, а игрок узнавал об утрате тайника только после F5.
 	 *
-	 * @returns {boolean} true — записано; false — запись заблокирована ранее.
+	 * @returns {boolean} true — записано; false — запись была разоружена ранее.
+	 * @throws любую ошибку localStorage — после показа блокирующей плашки.
 	 */
 	save() {
 		if (this._saveBlocked) return false
@@ -262,15 +261,12 @@ export class MetaSystem {
 
 		const v = Math.max(1, Math.round(Number(d.v ?? 1)) || 1)
 		if (v > SAVE_VERSION) {
-			/* Сейв из более новой сборки. Частично разобрать его — это тихо
-			 * потерять данные, которых мы не понимаем, а потом затереть их своим
-			 * v2. Поэтому: профиль остаётся дефолтным, запись блокируется. */
+			/* Сейв из более новой сборки. Разобрать его частично — тихо потерять
+			 * непонятные нам данные, а потом затереть их своим v2. Поэтому
+			 * профиль остаётся дефолтным, а запись — разоруженной. */
 			this._saveBlocked = true
 			console.warn('[meta] отказ загружать сейв версии ' + v + ' (поддерживается ' + SAVE_VERSION + ')')
-			this._saveFatal(
-				'Сохранение создано более новой версией игры (формат v' + v + ', эта сборка понимает v' + SAVE_VERSION + '). Профиль не загружен, и запись отключена, чтобы не затереть его.',
-				null
-			)
+			this._saveFatal('Сохранение создано более новой версией игры (формат v' + v + ', эта сборка понимает v' + SAVE_VERSION + '). Профиль не загружен, запись отключена, чтобы не затереть его.', null)
 			return false
 		}
 
@@ -281,10 +277,9 @@ export class MetaSystem {
 			 * гасим: только что прочитанное состояние сохранять не нужно. */
 			this._dirty = false
 			this._saveT = 0
-			console.info(
-				'[meta] профиль v' + v + ': lvl ' + this.P.lvl + ', ' + Math.round(this.P.money?.rub ?? 0) + ' ₽' +
-				(stats ? ', предметов ' + stats.items + ' (точно ' + stats.exact + ', перенесено ' + stats.moved + ', потеряно ' + stats.dropped + ')' : ', снапшот инвентаря отсутствует')
-			)
+			console.info('[meta] профиль v' + v + ': lvl ' + this.P.lvl + ', ' + Math.round(this.P.money?.rub ?? 0) + ' ₽' + (stats
+				? ', предметов ' + stats.items + ' (точно ' + stats.exact + ', перенесено ' + stats.moved + ', потеряно ' + stats.dropped + ')'
+				: ', снапшот инвентаря отсутствует'))
 			if (v < SAVE_VERSION) console.info('[meta] сейв v' + v + ' будет перезаписан как v' + SAVE_VERSION)
 			return true
 		} catch (e) {
@@ -296,7 +291,7 @@ export class MetaSystem {
 	/**
 	 * Раскладка снапшота инвентаря обратно в модель.
 	 *
-	 * Порядок жёсткий, иначе половина вещей уходит в никуда:
+	 * Порядок жёсткий, иначе половина вещей уйдёт в никуда:
 	 *   1. снести стартовый набор (его засеял InventorySystem.init());
 	 *   2. растянуть тайник до P.stashRows — Grid.resize() обнуляет ячейки;
 	 *   3. контейнеры тела (secure/rig/backpack) — они создают сетки in:<uid>;
@@ -305,7 +300,7 @@ export class MetaSystem {
 	 *   6. содержимое контейнеров — волнами, пока есть прогресс: контейнер
 	 *      внутри рюкзака получает свою сетку только после того, как лёг сам.
 	 *
-	 * @returns {{items:number,exact:number,moved:number,dropped:number}|null}
+	 * @returns {{items:number,exact:number,moved:number,dropped:number,weight:number}|null}
 	 */
 	_restoreInventory(d) {
 		const inv = this.inv
@@ -314,19 +309,17 @@ export class MetaSystem {
 			return null
 		}
 
-		/* 2. Тайник — до предметов. */
 		const rows = Math.max(1, Math.min(EFL.stash.maxRows, Math.round(Number(this.P.stashRows) || EFL.stash.rows)))
 		this.P.stashRows = rows
 
 		const tuples = Array.isArray(d?.inv) ? d.inv : []
 		if (!tuples.length) {
 			/* Ни одного кортежа: это не «пустой тайник», а сейв без снапшота.
-			 * Стартовый набор оставляем — сносить его нечем. */
+			 * Стартовый набор оставляем — менять его не на что. */
 			inv.grid('stash')?.resize(EFL.stash.width, rows)
 			return null
 		}
 
-		/* 1. */
 		inv.clearAll()
 		inv.grid('stash')?.resize(EFL.stash.width, rows)
 
@@ -363,32 +356,28 @@ export class MetaSystem {
 			return true
 		}
 
-		/* 3. Контейнеры тела. */
 		for (const slot of CONTAINER_SLOTS) {
 			const uid = bySlot.get(slot)
 			if (uid != null) place(recs.get(uid), 'slot:' + slot)
 		}
 
-		/* 4. Остальные слоты тела. */
 		for (const [slot, uid] of bySlot) {
 			if (CONTAINER_SLOTS.includes(slot)) continue
 			place(recs.get(uid), 'slot:' + slot)
 		}
-		/* 4b. Старый сейв мог не донести карту слотов — добираем по самому path. */
+		/* Старый сейв мог не донести карту слотов — добираем по самому path. */
 		for (const rec of recs.values()) {
 			if (done.has(rec.uid)) continue
 			const path = String(rec.path ?? '')
 			if (path.startsWith('slot:')) place(rec, path)
 		}
 
-		/* 5. Базовые сетки: тайник и карманы. */
 		for (const rec of recs.values()) {
 			if (done.has(rec.uid)) continue
 			const path = String(rec.path ?? 'stash')
 			if (!path.startsWith('in:')) place(rec, path)
 		}
 
-		/* 6. Содержимое контейнеров, волнами. */
 		let pending = []
 		for (const rec of recs.values()) {
 			if (!done.has(rec.uid) && String(rec.path ?? '').startsWith('in:')) pending.push(rec)
@@ -409,3 +398,169 @@ export class MetaSystem {
 		}
 
 		const stats = inv.commitRestore()
+		if (stats.dropped > 0) console.warn('[meta] при загрузке потеряно предметов: ' + stats.dropped)
+		return stats
+	}
+
+	/**
+	 * Громкая блокирующая плашка: персистентность потеряна.
+	 *
+	 * Перехватывает ввод на capture-фазе, чтобы клики и клавиши не уходили в игру
+	 * под ней (включая захват курсора по клику по canvas).
+	 */
+	_saveFatal(reason, err) {
+		const detail = err ? String(err?.message ?? err) : ''
+		console.error('[meta] ПРОФИЛЬ НЕ СОХРАНЁН: ' + reason, err ?? '')
+		this.ctx?.events?.emit('meta:saveFailed', { reason, detail })
+
+		if (typeof document === 'undefined' || !document.body) {
+			if (typeof alert === 'function') alert('ПРОФИЛЬ НЕ СОХРАНЁН\n\n' + reason)
+			return
+		}
+		if (document.getElementById(WARN_ID)) return
+
+		const wrap = document.createElement('div')
+		wrap.id = WARN_ID
+		wrap.setAttribute('role', 'alertdialog')
+		wrap.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(6,7,8,.88);font:13px/1.5 "Oswald","Segoe UI",sans-serif;letter-spacing:.06em;color:#e8dcc0'
+
+		const card = document.createElement('div')
+		card.style.cssText = 'max-width:560px;padding:26px 30px;border:1px solid #a33;background:linear-gradient(160deg,rgba(30,18,18,.98),rgba(12,10,10,.98));box-shadow:0 24px 60px rgba(0,0,0,.7)'
+
+		const title = document.createElement('div')
+		title.textContent = 'ПРОФИЛЬ НЕ СОХРАНЁН'
+		title.style.cssText = 'font-size:18px;letter-spacing:.22em;color:#e2544a;margin-bottom:14px'
+
+		const body = document.createElement('div')
+		body.textContent = reason
+		body.style.cssText = 'margin-bottom:10px;color:#d7dbd3'
+
+		const hint = document.createElement('div')
+		hint.textContent = 'Тайник, деньги и прогресс этой сессии не переживут перезагрузку страницы. Автосейв остановлен. Освободите место в хранилище браузера и нажмите ПОВТОРИТЬ.'
+		hint.style.cssText = 'margin-bottom:14px;font-size:12px;color:#9aa29a'
+
+		const tech = document.createElement('div')
+		tech.textContent = detail
+		tech.style.cssText = 'max-height:96px;overflow:auto;margin-bottom:18px;font:11px/1.4 Consolas,monospace;color:#7f877f;word-break:break-word'
+
+		const row = document.createElement('div')
+		row.style.cssText = 'display:flex;gap:10px;justify-content:flex-end'
+
+		const EVT = ['keydown', 'keyup', 'keypress', 'mousedown', 'mouseup', 'click', 'wheel', 'contextmenu']
+		const swallow = (e) => { if (!wrap.contains(e.target)) e.stopPropagation() }
+		const close = () => {
+			for (const t of EVT) window.removeEventListener(t, swallow, true)
+			wrap.remove()
+		}
+
+		const retry = document.createElement('button')
+		retry.type = 'button'
+		retry.textContent = 'ПОВТОРИТЬ'
+		retry.style.cssText = BTN_CSS
+		retry.addEventListener('click', () => {
+			close()
+			this._saveBlocked = false
+			this._dirty = true
+			this._saveT = 0
+			try {
+				this.save()
+			} catch (e) {
+				/* Не прошло снова — save() уже поднял плашку заново. */
+			}
+		})
+
+		const ignore = document.createElement('button')
+		ignore.type = 'button'
+		ignore.textContent = 'ИГРАТЬ БЕЗ СЕЙВА'
+		ignore.style.cssText = BTN_CSS
+		ignore.addEventListener('click', close)
+
+		row.append(retry, ignore)
+		card.append(title, body, hint, tech, row)
+		wrap.append(card)
+		for (const t of EVT) window.addEventListener(t, swallow, true)
+		document.body.appendChild(wrap)
+		retry.focus()
+	}
+
+	/** Сейв не чаще раза в 8 секунд и никогда во время боя. */
+	update(dt, ctx) {
+		if (!this._dirty || this._saveBlocked) return
+		this._saveT += dt
+		if (this._saveT < 8) return
+		const raid = ctx.peek('raid')
+		if (raid?.active && ctx.peek('ai')?.bots?.some((b) => b.state === 3)) return
+		this._saveT = 0
+		this.save()
+	}
+
+	/**
+	 * Публичное начисление опыта и фиксация его в профиль.
+	 *
+	 * До этого опыт умел зачислять только приватный _afterRaid() по событию
+	 * raid:end, так что ни один экран UI не мог записать прогресс в профиль:
+	 * meta.addExperience() просто не существовало.
+	 *
+	 * @param {number} amount — опыт за рейд (мусор и отрицательные гасятся в 0,
+	 *   иначе undefined превратил бы P.xp в NaN и убил сейв).
+	 * @param {{ commit?: boolean }} [opts] — commit: false откладывает запись на диск.
+	 * @returns {{ lvl: number, xp: number, gained: number, leveledUp: boolean }}
+	 */
+	addExperience(amount, opts = {}) {
+		const gained = Math.max(0, Math.round(Number(amount) || 0))
+		const lvlBefore = this.P.lvl
+		if (gained <= 0) return { lvl: this.P.lvl, xp: this.P.xp, gained: 0, leveledUp: false }
+
+		/* Старые сейвы могли прийти без bp — иначе P.bp.xp упал бы с TypeError. */
+		if (!this.P.bp || typeof this.P.bp !== 'object') this.P.bp = { tier: 0, xp: 0 }
+
+		this.P.xp += gained
+		while (this.P.xp >= this._need(this.P.lvl)) { this.P.xp -= this._need(this.P.lvl); this.P.lvl++ }
+
+		this.P.bp.xp += gained
+		while (this.P.bp.xp >= 1200 && this.P.bp.tier < 53) { this.P.bp.xp -= 1200; this.P.bp.tier++ }
+
+		this._dirty = true
+		const leveledUp = this.P.lvl > lvlBefore
+		this.ctx?.events?.emit('meta:xp', { gained, lvl: this.P.lvl, xp: this.P.xp, leveledUp })
+		if (opts.commit !== false) {
+			try {
+				this.save()                                    // фиксация в localStorage
+			} catch (e) {
+				/* Плашка уже поднята в save(). Откатывать начисление нечего:
+				 * профиль в памяти корректен, потерян только диск. */
+				console.error('[meta] опыт начислен, но не сохранён', e)
+			}
+		}
+		return { lvl: this.P.lvl, xp: this.P.xp, gained, leveledUp }
+	}
+
+	_afterRaid({ kind, summary }) {
+		const s = summary || {}
+		this.P.stats.raids++
+		if (kind === 'survived') this.P.stats.survived++
+		this.P.stats.kills += Math.max(0, Math.round(Number(s.kills) || 0))
+		/* Опыт, боевой пропуск, уровни и коммит — внутри addExperience():
+		 * единая точка начисления, чтобы экран итогов не посчитал тот же
+		 * опыт второй раз. */
+		this.addExperience(s.xp)
+		this._dirty = true
+		try {
+			this.save()                                      // после рейда — сразу, кадры уже не важны
+		} catch (e) {
+			console.error('[meta] сейв после рейда не прошёл', e)
+		}
+	}
+	_need(lvl) { return Math.round(1000 * Math.pow(lvl, 1.35)) }
+
+	dispose() {
+		if (!this._dirty || this._saveBlocked) return
+		try {
+			this.save()
+		} catch (e) {
+			/* Бросать из dispose() нельзя: его зовут при HMR и закрытии страницы,
+			 * исключение оставит движок недоразобранным. Плашка уже показана. */
+			console.error('[meta] финальный сейв не прошёл', e)
+		}
+	}
+}
