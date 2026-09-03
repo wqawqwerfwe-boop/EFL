@@ -34,6 +34,14 @@
  * ctx.get() throws for an unregistered id. Every read below therefore tolerates
  * a missing system.
  *
+ * ARMOUR ZONES. The hit capsule is tagged with its named armour zone from
+ * src/core/anatomy.js (see init) because ballistics picks the plate that covers
+ * the zone it hit. The player has exactly ONE capsule, so that tag is the whole
+ * story and it is the chest: a head shot consults the chest plate, and a helmet
+ * cannot stop it. Splitting the capsule into per-zone bands is a real change
+ * with a real test plan — see the note in init(). Limb routing for the WOUND is
+ * not affected: HealthSystem resolves that from the live capsule below.
+ *
  * PUBLIC API — `const p = ctx.get('player')`
  *
  * TRANSFORM
@@ -45,7 +53,7 @@
  *   p.speed / p.horizontalSpeed
  *   p.character       the physics CharacterController (read-only)
  *   p.height          capsule height of the current stance
- *   p.hitbox          physics collider on LAYER.PLAYER
+ *   p.hitbox          physics collider on LAYER.PLAYER, armour-zone tagged
  *
  * STATE
  *   p.state           'stand'|'crouch'|'prone'|'sprint'|'tacsprint'|'slide'|
@@ -101,6 +109,7 @@ import { LowHealthPass } from './lowhealth.js'
 import { STANCE, MOVE, CAMERA, HEALTH, FOOTSTEP, JUMP_SPEED } from './tuning.js'
 import { clamp, clamp01, lerp, approach, DEG } from './springs.js'
 import { PARTS, PART_INDEX, partIndexOf, E_BLEED_L, E_BLEED_H, E_FRACTURE } from '../health/index.js'
+import { DEFAULT_ZONE, PART_INDEX_BY_ZONE, tagColliderZone } from '../core/anatomy.js'
 
 export class PlayerSystem {
   static id = 'player'
@@ -113,6 +122,8 @@ export class PlayerSystem {
     this.rig = null
     this.lowHealthPass = null
     this.hitbox = null
+    /** Named armour zone published on the hit capsule. Set in init(). */
+    this.hitboxZone = null
     /** Cached HealthSystem. Never assigned directly — see the `health` getter. */
     this._health = null
 
@@ -247,6 +258,28 @@ export class PlayerSystem {
       part: 'torso',
       radius: 0.3,
     })
+
+    /* ARMOUR ZONE. Ballistics reads userData.zone off the capsule it hit to
+     * find the plate covering that spot, and falls back to the part-index table
+     * when the tag is missing. This collider is built without a part index, so
+     * that fallback was landing on the default zone by luck rather than by
+     * contract — and index 0 is the head, which would have put every round we
+     * take against the helmet. State it once instead, and take both the index
+     * and the string from the authority so no zone name is spelled out here.
+     *
+     * ONE capsule means ONE zone, and it is the chest: a head shot consults the
+     * chest plate. Tiling this capsule into head/thorax/stomach/leg bands is
+     * the fix, and it is not a one-liner — stacked capsules sharing a volume do
+     * not resolve the way the tag implies. At the current 0.3 m radius the
+     * chest band's top cap stands 0.277 m off the axis at head height against
+     * 0.11 m for a head band, so a horizontal ray hits the chest first and head
+     * shots still read as thorax, while the silhouette an AI shoots at changes
+     * width. That needs each band inset by its own radius plus a capture run to
+     * prove nothing became unhittable.
+     *
+     * The WOUND is already correct: HealthSystem resolves the limb from the
+     * world-space height against the live capsule below, through every stance. */
+    this.hitboxZone = tagColliderZone(this.hitbox, PART_INDEX_BY_ZONE[DEFAULT_ZONE], null, 'torso')
     this._syncHitbox()
 
     // ---- low-health treatment -------------------------------------------
@@ -267,7 +300,7 @@ export class PlayerSystem {
       `[player] spawn ${spawn.feet.x.toFixed(1)}, ${spawn.feet.y.toFixed(2)}, ` +
       `${spawn.feet.z.toFixed(1)} · walk ${STANCE.stand.speed} sprint ${MOVE.sprintSpeed} ` +
       `tac ${MOVE.tacSprintSpeed} m/s · jump ${JUMP_SPEED.toFixed(2)} m/s (apex 0.60 m) · ` +
-      `health ${this._health ? 'limb model' : 'unattached'}`
+      `health ${this._health ? 'limb model' : 'unattached'} · armour zone ${this.hitboxZone}`
     )
   }
 
@@ -1084,6 +1117,7 @@ export class PlayerSystem {
       blacked: health ? health.blackedLegs() + health.blackedArms() : 0,
       bleeds: health ? health.bleedCount() : { light: 0, heavy: 0 },
       suppression: this.suppression,
+      armourZone: this.hitboxZone,
     }
   }
 
