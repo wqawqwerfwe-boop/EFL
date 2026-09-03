@@ -16,13 +16,17 @@
  *
  * DAMAGE is per-bone: capsule colliders for head, chest, pelvis, arms and legs
  * are pushed into `physics` every frame, so a headshot is a headshot because of
- * where the round landed, not because of a random roll. Death hands the live
- * skeleton to the ragdoll solver with the bullet's impulse.
+ * where the round landed, not because of a random roll. Each capsule also
+ * publishes its named armour zone on `userData.zone` (see src/core/anatomy.js),
+ * which is what lets the penetration solver find the plate that actually covers
+ * the spot it hit. Death hands the live skeleton to the ragdoll solver with the
+ * bullet's impulse.
  */
 
 import * as THREE from 'three';
 import { RIG } from './rig.js';
 import { Animator } from './animator.js';
+import { resolveZone } from '../core/anatomy.js';
 
 const STATE = {
   IDLE: 'idle',
@@ -37,6 +41,14 @@ const STATE = {
 
 export { STATE };
 
+/**
+ * Hit capsules, in the canonical part order. THE INDEX IS THE PART INDEX, and
+ * src/core/anatomy.js maps it straight onto an armour zone:
+ *   0 head · 1 thorax · 2 stomach · 3 arm_right · 4 arm_left · 5 leg_right ·
+ *   6 leg_left
+ * Reordering this array silently re-labels every armour zone, so don't.
+ *   [ part, boneA, boneB, radius, damageScale ]
+ */
 const HITBOXES = [
   ['head', 'Head', 'HeadTop', 0.098, 4.0],
   ['torso', 'Spine1', 'Neck', 0.185, 1.0],
@@ -157,17 +169,28 @@ export class Agent {
 
     this.colliders = [];
     if (phys) {
-      for (const [part, a, b, r, dmg] of HITBOXES) {
+      for (let i = 0; i < HITBOXES.length; i++) {
+        const [part, a, b, r, dmg] = HITBOXES[i];
+        // The named armour zone is resolved ONCE, here, from the authority in
+        // src/core/anatomy.js: collider index first, rig bone second, coarse
+        // part tag last. Ballistics reads it off the capsule that was hit, so a
+        // helmet can stop a round to the crown and a leg hit can stop eating
+        // durability off a chest plate that never covered it.
+        const zone = resolveZone(i, a, part);
         const c = phys.addCollider({
           shape: 'capsule',
           layer: phys.LAYER.ACTOR,
           surface: 'flesh',
           owner: this,
           part,
+          partIndex: i,
+          zone,
           radius: r * this.scale,
           damageScale: dmg,
         });
-        c.userData = { a, b };
+        // `a` and `b` stay the first two fields: syncHitboxes() destructures
+        // them every frame.
+        c.userData = { a, b, part, partIndex: i, zone, zonePartIndex: i };
         this.colliders.push(c);
       }
     }
