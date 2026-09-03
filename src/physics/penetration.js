@@ -1,11 +1,18 @@
-import * as THREE from 'three';
+import * as THREE from 'three'
 
 import {
   SURFACE as CANON,
   SURFACE_BALLISTICS,
   SURFACE_NAMES,
   SURFACE_THICKNESS,
-} from '../core/surfaces.js';
+} from '../core/surfaces.js'
+import {
+  ArmorResolver,
+  PEN_CURVE,
+  armorDurabilityLoss,
+  penetrationChance as armorPenetrationChance,
+} from './armor.js'
+import { healthPartOf, pickHeadSubZone, zoneForPartIndex } from '../core/anatomy.js'
 
 /*
  * Escape from Larpov - ballistics and penetration solver.
@@ -24,9 +31,9 @@ import {
  * треугольник, читался решателем как другой материал (11 - штукатурка там,
  * плоть здесь). Единое индексное пространство теперь одно на весь проект.
  */
-export const SURFACE_ORDER = SURFACE_NAMES;
+export const SURFACE_ORDER = SURFACE_NAMES
 
-const SURF_N = SURFACE_ORDER.length;
+const SURF_N = SURFACE_ORDER.length
 
 /*
  * Баллистика поверхностей (значения живут в src/core/surfaces.js).
@@ -44,24 +51,24 @@ export const SURFACE = {
   ric: new Float32Array(SURF_N),
   ang: new Float32Array(SURF_N),
   pass: new Float32Array(SURF_N),
-};
+}
 
 for (let i = 0; i < SURF_N; i++) {
-  const s = SURFACE_BALLISTICS[SURFACE_ORDER[i]];
-  SURFACE.cost[i] = s.cost;
-  SURFACE.ric[i] = s.ric;
-  SURFACE.ang[i] = Math.cos((90 - s.ang) * Math.PI / 180);
-  SURFACE.pass[i] = s.pass;
+  const s = SURFACE_BALLISTICS[SURFACE_ORDER[i]]
+  SURFACE.cost[i] = s.cost
+  SURFACE.ric[i] = s.ric
+  SURFACE.ang[i] = Math.cos((90 - s.ang) * Math.PI / 180)
+  SURFACE.pass[i] = s.pass
 }
 
 export function surfaceIndex(name) {
-  const i = CANON[name];
-  return i === undefined ? 0 : i;
+  const i = CANON[name]
+  return i === undefined ? 0 : i
 }
 
 export function surfaceName(index) {
-  const n = SURFACE_ORDER[index];
-  return n === undefined ? 'concrete' : n;
+  const n = SURFACE_ORDER[index]
+  return n === undefined ? 'concrete' : n
 }
 
 /*
@@ -87,9 +94,9 @@ const AMMO_RAW = [
   ['12x70_magnum', '12x70 магнум', '12x70', 50, 2, 430, 0, 0.12, 10, 0, 0.0034],
   ['12x70_slug', '12x70 пуля', '12x70', 165, 20, 470, 0.02, 0.3, 34, 0, 0.032],
   ['12x70_flechette', '12x70 флешетта', '12x70', 25, 31, 400, 0, 0.35, 30, 0, 0.0028],
-];
+]
 
-const AMMO_N = AMMO_RAW.length;
+const AMMO_N = AMMO_RAW.length
 
 export const AMMO = {
   count: AMMO_N,
@@ -104,30 +111,30 @@ export const AMMO = {
   armorDamage: new Float32Array(AMMO_N),
   tracer: new Uint8Array(AMMO_N),
   weight: new Float32Array(AMMO_N),
-};
-
-const AMMO_BY_ID = Object.create(null);
-const AMMO_BY_CAL = Object.create(null);
-
-for (let i = 0; i < AMMO_N; i++) {
-  const r = AMMO_RAW[i];
-  AMMO.id[i] = r[0];
-  AMMO.name[i] = r[1];
-  AMMO.cal[i] = r[2];
-  AMMO.damage[i] = r[3];
-  AMMO.pen[i] = r[4];
-  AMMO.speed[i] = r[5];
-  AMMO.fragChance[i] = r[6];
-  AMMO.ricochet[i] = r[7];
-  AMMO.armorDamage[i] = r[8];
-  AMMO.tracer[i] = r[9];
-  AMMO.weight[i] = r[10];
-  AMMO_BY_ID[r[0]] = i;
-  if (!AMMO_BY_CAL[r[2]]) AMMO_BY_CAL[r[2]] = [];
-  AMMO_BY_CAL[r[2]].push(i);
 }
 
-export const AMMO_IDS = AMMO.id.slice();
+const AMMO_BY_ID = Object.create(null)
+const AMMO_BY_CAL = Object.create(null)
+
+for (let i = 0; i < AMMO_N; i++) {
+  const r = AMMO_RAW[i]
+  AMMO.id[i] = r[0]
+  AMMO.name[i] = r[1]
+  AMMO.cal[i] = r[2]
+  AMMO.damage[i] = r[3]
+  AMMO.pen[i] = r[4]
+  AMMO.speed[i] = r[5]
+  AMMO.fragChance[i] = r[6]
+  AMMO.ricochet[i] = r[7]
+  AMMO.armorDamage[i] = r[8]
+  AMMO.tracer[i] = r[9]
+  AMMO.weight[i] = r[10]
+  AMMO_BY_ID[r[0]] = i
+  if (!AMMO_BY_CAL[r[2]]) AMMO_BY_CAL[r[2]] = []
+  AMMO_BY_CAL[r[2]].push(i)
+}
+
+export const AMMO_IDS = AMMO.id.slice()
 
 /* Патрон по умолчанию для калибра. Совпадает с тем, что выдаёт Скупщик на 1 уровне. */
 const CAL_DEFAULT = {
@@ -137,61 +144,64 @@ const CAL_DEFAULT = {
   '9x18': '9x18_pst',
   '762x54': '762x54_lps',
   '12x70': '12x70_buck',
-};
+}
 
 export function ammoIndex(id) {
-  const i = AMMO_BY_ID[id];
-  return i === undefined ? -1 : i;
+  const i = AMMO_BY_ID[id]
+  return i === undefined ? -1 : i
 }
 
 export function ammoForCaliber(cal) {
-  const id = CAL_DEFAULT[cal];
+  const id = CAL_DEFAULT[cal]
   if (id !== undefined) {
-    const i = AMMO_BY_ID[id];
-    if (i !== undefined) return i;
+    const i = AMMO_BY_ID[id]
+    if (i !== undefined) return i
   }
-  const list = AMMO_BY_CAL[cal];
-  if (list && list.length > 0) return list[0];
-  return 0;
+  const list = AMMO_BY_CAL[cal]
+  if (list && list.length > 0) return list[0]
+  return 0
 }
 
 export function ammoListForCaliber(cal) {
-  const list = AMMO_BY_CAL[cal];
-  return list ? list.slice() : [];
+  const list = AMMO_BY_CAL[cal]
+  return list ? list.slice() : []
 }
 
-const MAX_STEPS = 6;
-const MAX_RANGE = 420;
-const MIN_DAMAGE = 1.5;
-const SKIN = 0.02;
-const MASK_ALL = 3;
+const MAX_STEPS = 6
+const MAX_RANGE = 420
+const MIN_DAMAGE = 1.5
+const SKIN = 0.02
+const MASK_ALL = 3
+
+/* Канонические 20 процентов, которые броня снимает с пробившей её пули. */
+const ARMOR_PEN_DAMAGE = 0.8
 
 function mulberry32(seed) {
-  let a = seed >>> 0;
+  let a = seed >>> 0
   return function next() {
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
+    a = (a + 0x6d2b79f5) | 0
+    let t = Math.imul(a ^ (a >>> 15), 1 | a)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
 }
 
 function makeRng(ctx, label) {
-  const r = ctx && ctx.rng;
+  const r = ctx && ctx.rng
   if (r) {
     if (typeof r.fork === 'function') {
-      const f = r.fork(label);
-      if (typeof f === 'function') return f;
-      if (f && typeof f.next === 'function') return function next() { return f.next(); };
-      if (f && typeof f.float === 'function') return function next() { return f.float(); };
+      const f = r.fork(label)
+      if (typeof f === 'function') return f
+      if (f && typeof f.next === 'function') return function next() { return f.next() }
+      if (f && typeof f.float === 'function') return function next() { return f.float() }
     }
-    if (typeof r === 'function') return r;
-    if (typeof r.next === 'function') return function next() { return r.next(); };
-    if (typeof r.float === 'function') return function next() { return r.float(); };
+    if (typeof r === 'function') return r
+    if (typeof r.next === 'function') return function next() { return r.next() }
+    if (typeof r.float === 'function') return function next() { return r.float() }
   }
-  let a = 0x9e3779b9;
-  for (let i = 0; i < label.length; i++) a = (Math.imul(a ^ label.charCodeAt(i), 16777619) >>> 0);
-  return mulberry32(a);
+  let a = 0x9e3779b9
+  for (let i = 0; i < label.length; i++) a = (Math.imul(a ^ label.charCodeAt(i), 16777619) >>> 0)
+  return mulberry32(a)
 }
 
 /* Результат рейкаста. Создаётся один раз на решатель. */
@@ -205,16 +215,16 @@ function makeHitStruct() {
     actor: null,
     partIndex: -1,
     object: null,
-  };
+  }
 }
 
 function resetHit(h) {
-  h.hit = false;
-  h.distance = 0;
-  h.surface = 0;
-  h.actor = null;
-  h.partIndex = -1;
-  h.object = null;
+  h.hit = false
+  h.distance = 0
+  h.surface = 0
+  h.actor = null
+  h.partIndex = -1
+  h.object = null
 }
 
 /*
@@ -225,58 +235,58 @@ function resetHit(h) {
 function buildCast(phys) {
   if (!phys) {
     return function castNone() {
-      return false;
-    };
+      return false
+    }
   }
 
   if (typeof phys.raycastInto === 'function') {
     return function castInto(origin, dir, maxDist, out, mask) {
-      resetHit(out);
-      phys.raycastInto(origin, dir, maxDist, out, mask);
-      return !!out.hit;
-    };
+      resetHit(out)
+      phys.raycastInto(origin, dir, maxDist, out, mask)
+      return !!out.hit
+    }
   }
 
-  const pick = typeof phys.raycast === 'function' ? phys.raycast : typeof phys.raycastFirst === 'function' ? phys.raycastFirst : typeof phys.intersectRay === 'function' ? phys.intersectRay : null;
+  const pick = typeof phys.raycast === 'function' ? phys.raycast : typeof phys.raycastFirst === 'function' ? phys.raycastFirst : typeof phys.intersectRay === 'function' ? phys.intersectRay : null
 
   if (!pick) {
     return function castMissing() {
-      return false;
-    };
+      return false
+    }
   }
 
   return function castCopy(origin, dir, maxDist, out, mask) {
-    resetHit(out);
-    const r = pick.call(phys, origin, dir, maxDist, mask);
-    if (!r) return false;
-    const p = r.point || r.position;
-    const n = r.normal || r.faceNormal;
-    if (p) out.point.set(p.x, p.y, p.z);
-    if (n) out.normal.set(n.x, n.y, n.z);
-    out.distance = r.distance === undefined ? origin.distanceTo(out.point) : r.distance;
-    out.actor = r.actor === undefined ? null : r.actor;
-    out.partIndex = r.partIndex === undefined ? -1 : r.partIndex;
-    out.object = r.object === undefined ? null : r.object;
-    if (typeof r.surface === 'number') out.surface = r.surface;
-    else if (typeof r.surface === 'string') out.surface = surfaceIndex(r.surface);
-    else if (r.object && r.object.userData && r.object.userData.surfaceIndex !== undefined) out.surface = r.object.userData.surfaceIndex;
-    else out.surface = 0;
-    out.hit = true;
-    return true;
-  };
+    resetHit(out)
+    const r = pick.call(phys, origin, dir, maxDist, mask)
+    if (!r) return false
+    const p = r.point || r.position
+    const n = r.normal || r.faceNormal
+    if (p) out.point.set(p.x, p.y, p.z)
+    if (n) out.normal.set(n.x, n.y, n.z)
+    out.distance = r.distance === undefined ? origin.distanceTo(out.point) : r.distance
+    out.actor = r.actor === undefined ? null : r.actor
+    out.partIndex = r.partIndex === undefined ? -1 : r.partIndex
+    out.object = r.object === undefined ? null : r.object
+    if (typeof r.surface === 'number') out.surface = r.surface
+    else if (typeof r.surface === 'string') out.surface = surfaceIndex(r.surface)
+    else if (r.object && r.object.userData && r.object.userData.surfaceIndex !== undefined) out.surface = r.object.userData.surfaceIndex
+    else out.surface = 0
+    out.hit = true
+    return true
+  }
 }
 
 /*
  * Номинальная толщина преграды в метрах для расчёта цены пробития.
  * Значения канонические: src/core/surfaces.js, порядок - SURFACE_ORDER.
  */
-const PEN_SCALE = 3;
+const PEN_SCALE = 3
 
-const THICK = new Float32Array(SURF_N);
-const PEN_COST = new Float32Array(SURF_N);
+const THICK = new Float32Array(SURF_N)
+const PEN_COST = new Float32Array(SURF_N)
 for (let i = 0; i < SURF_N; i++) {
-  THICK[i] = SURFACE_THICKNESS[i];
-  PEN_COST[i] = SURFACE.cost[i] * THICK[i] * PEN_SCALE;
+  THICK[i] = SURFACE_THICKNESS[i]
+  PEN_COST[i] = SURFACE.cost[i] * THICK[i] * PEN_SCALE
 }
 
 /*
@@ -284,22 +294,29 @@ for (let i = 0; i < SURF_N; i++) {
  * старого локального порядка. В каноническом пространстве плоть - 19,
  * а 11 - песок, то есть сквозное пробитие тела считалось по песку.
  */
-const FLESH = CANON.flesh;
+const FLESH = CANON.flesh
 
 export class PenetrationSolver {
   constructor(physics, ctx) {
-    this.physics = physics || null;
-    this.ctx = ctx || null;
-    this.rng = makeRng(ctx, 'ballistics');
-    this._cast = buildCast(physics);
+    this.physics = physics || null
+    this.ctx = ctx || null
+    this.rng = makeRng(ctx, 'ballistics')
+    /*
+     * Отдельный поток для брони. Форк именно 'bullet:impact': бросок пробития
+     * должен идти в локстепе с самим событием попадания, иначе реплей разойдётся
+     * с оригиналом на первой же плите.
+     */
+    this.armorRng = makeRng(ctx, 'bullet:impact')
+    this.armor = new ArmorResolver(ctx)
+    this._cast = buildCast(physics)
 
     /* --- Весь пул векторов решателя. Больше ничего не создаётся. --- */
-    this._hit = makeHitStruct();
-    this._pos = new THREE.Vector3();
-    this._dir = new THREE.Vector3();
-    this._from = new THREE.Vector3();
-    this._end = new THREE.Vector3();
-    this._inc = new THREE.Vector3();
+    this._hit = makeHitStruct()
+    this._pos = new THREE.Vector3()
+    this._dir = new THREE.Vector3()
+    this._from = new THREE.Vector3()
+    this._end = new THREE.Vector3()
+    this._inc = new THREE.Vector3()
 
     /* Пейлоады событий. surface — СТРОКА, именно её ждёт аудио и fx. */
     this._impact = {
@@ -317,74 +334,115 @@ export class PenetrationSolver {
       partIndex: -1,
       ammo: 0,
       distance: 0,
-    };
-    this._tracer = { from: this._from, to: this._end, speed: 0, ammo: 0, tracer: 0 };
-    this._dmg = { actor: null, amount: 0, partIndex: -1, source: null, ammo: 0, armorDamage: 0 };
+      /* Именованная анатомия попадания: см. src/core/anatomy.js. */
+      zone: null,
+      subZone: null,
+      healthPart: null,
+      armorBlocked: false,
+      armorPenetrated: false,
+      armorClass: 0,
+      armorItem: null,
+      armorDurability: 0,
+    }
+    /* armor:damaged — плита получила по себе. Аудио играет деформацию, UI мигает. */
+    this._armorEvent = {
+      item: null,
+      def: null,
+      zone: null,
+      subZone: null,
+      durBefore: 0,
+      durAfter: 0,
+      durMax: 0,
+      penetrated: false,
+      chance: 0,
+      material: null,
+      armorClass: 0,
+      target: null,
+      ammo: 0,
+      destroyed: false,
+    }
+    this._tracer = { from: this._from, to: this._end, speed: 0, ammo: 0, tracer: 0 }
+    this._dmg = { actor: null, amount: 0, partIndex: -1, source: null, ammo: 0, armorDamage: 0 }
 
-    this.stats = { shots: 0, hits: 0, penetrations: 0, ricochets: 0, kills: 0 };
+    this.stats = { shots: 0, hits: 0, penetrations: 0, ricochets: 0, kills: 0, armorBlocks: 0, armorPens: 0 }
   }
 
   /* Перепривязка к физике: адаптер пересобирается один раз, не в кадре. */
   attach(physics, ctx) {
-    this.physics = physics || null;
+    this.physics = physics || null
     if (ctx) {
-      this.ctx = ctx;
-      this.rng = makeRng(ctx, 'ballistics');
+      this.ctx = ctx
+      this.rng = makeRng(ctx, 'ballistics')
+      this.armorRng = makeRng(ctx, 'bullet:impact')
+      this.armor.attach(ctx)
     }
-    this._cast = buildCast(this.physics);
-    return this;
+    this._cast = buildCast(this.physics)
+    return this
   }
 
   _emit(name, payload) {
-    const ev = this.ctx && this.ctx.events;
-    if (ev && typeof ev.emit === 'function') ev.emit(name, payload);
+    const ev = this.ctx && this.ctx.events
+    if (ev && typeof ev.emit === 'function') ev.emit(name, payload)
   }
 
-  /* Класс брони в точке попадания. 0 — брони нет. */
+  /**
+   * Шанс пробития брони. Тонкая обёртка над кривой из ./armor.js, вынесенная на
+   * решатель: UI прицела и тесты баланса спрашивают именно решатель.
+   *
+   * @param {number} penPower пробивная способность патрона
+   * @param {number} armorClass класс брони 1..6
+   * @param {number} durabilityPercent остаток ресурса 0..100 (dur / durMax * 100)
+   * @returns {number} вероятность 0..1
+   */
+  penetrationChance(penPower, armorClass, durabilityPercent) {
+    return armorPenetrationChance(penPower, armorClass, durabilityPercent)
+  }
+
+  /* Класс брони в точке попадания. 0 — брони нет. Легаси-путь для ИИ. */
   _armorOf(actor, partIndex) {
-    if (!actor) return 0;
+    if (!actor) return 0
     if (typeof actor.armorAt === 'function') {
-      const a = actor.armorAt(partIndex);
-      return typeof a === 'number' ? a : 0;
+      const a = actor.armorAt(partIndex)
+      return typeof a === 'number' ? a : 0
     }
     if (actor.armorParts && partIndex >= 0) {
-      const a = actor.armorParts[partIndex];
-      if (typeof a === 'number') return a;
+      const a = actor.armorParts[partIndex]
+      if (typeof a === 'number') return a
     }
     /* Грудь и живот — индексы 1 и 2 в HITBOX. Бронежилет прикрывает только их. */
     if (partIndex === 1 || partIndex === 2) {
-      if (typeof actor.armorClass === 'number') return actor.armorClass;
-      if (typeof actor.armor === 'number') return actor.armor;
+      if (typeof actor.armorClass === 'number') return actor.armorClass
+      if (typeof actor.armor === 'number') return actor.armor
     }
-    if (partIndex === 0 && typeof actor.helmetClass === 'number') return actor.helmetClass;
-    return 0;
+    if (partIndex === 0 && typeof actor.helmetClass === 'number') return actor.helmetClass
+    return 0
   }
 
   /* Нанесение урона. Перебирает возможные имена методов актора. */
   _deal(actor, amount, partIndex, shooter, ammoIdx, armorDamage) {
-    if (!actor) return;
-    let done = false;
+    if (!actor) return
+    let done = false
     if (typeof actor.applyBulletDamage === 'function') {
-      actor.applyBulletDamage(amount, partIndex, shooter, ammoIdx, armorDamage);
-      done = true;
+      actor.applyBulletDamage(amount, partIndex, shooter, ammoIdx, armorDamage)
+      done = true
     } else if (typeof actor.takeDamage === 'function') {
-      actor.takeDamage(amount, partIndex, shooter);
-      done = true;
+      actor.takeDamage(amount, partIndex, shooter)
+      done = true
     } else if (typeof actor.damage === 'function') {
-      actor.damage(amount, partIndex, shooter);
-      done = true;
+      actor.damage(amount, partIndex, shooter)
+      done = true
     } else if (typeof actor.hit === 'function') {
-      actor.hit(amount, partIndex, shooter);
-      done = true;
+      actor.hit(amount, partIndex, shooter)
+      done = true
     }
-    this._dmg.actor = actor;
-    this._dmg.amount = amount;
-    this._dmg.partIndex = partIndex;
-    this._dmg.source = shooter || null;
-    this._dmg.ammo = ammoIdx;
-    this._dmg.armorDamage = armorDamage;
-    this._dmg.handled = done;
-    this._emit('damage:dealt', this._dmg);
+    this._dmg.actor = actor
+    this._dmg.amount = amount
+    this._dmg.partIndex = partIndex
+    this._dmg.source = shooter || null
+    this._dmg.ammo = ammoIdx
+    this._dmg.armorDamage = armorDamage
+    this._dmg.handled = done
+    this._emit('damage:dealt', this._dmg)
   }
 
   /*
@@ -392,197 +450,264 @@ export class PenetrationSolver {
    * origin и dir не мутируются — их владелец (WeaponSystem) переиспользует свои векторы.
    */
   solve(origin, dir, ammoIdx, shooter) {
-    const idx = ammoIdx >= 0 && ammoIdx < AMMO.count ? ammoIdx : 0;
-    let damage = AMMO.damage[idx];
-    let pen = AMMO.pen[idx];
-    const speed = AMMO.speed[idx];
+    const idx = ammoIdx >= 0 && ammoIdx < AMMO.count ? ammoIdx : 0
+    let damage = AMMO.damage[idx]
+    let pen = AMMO.pen[idx]
+    const speed = AMMO.speed[idx]
 
-    this._pos.set(origin.x, origin.y, origin.z);
-    this._dir.set(dir.x, dir.y, dir.z);
-    this._from.set(origin.x, origin.y, origin.z);
+    this._pos.set(origin.x, origin.y, origin.z)
+    this._dir.set(dir.x, dir.y, dir.z)
+    this._from.set(origin.x, origin.y, origin.z)
 
-    let range = MAX_RANGE;
-    let travelled = 0;
-    let steps = 0;
-    const hit = this._hit;
-    const imp = this._impact;
-    this.stats.shots++;
+    let range = MAX_RANGE
+    let travelled = 0
+    let steps = 0
+    const hit = this._hit
+    const imp = this._impact
+    this.stats.shots++
 
     while (steps < MAX_STEPS && range > 0.05 && damage > MIN_DAMAGE) {
-      steps++;
+      steps++
 
       if (!this._cast(this._pos, this._dir, range, hit, MASK_ALL)) {
         /* Промах: трассер до конца дальности и выход. */
-        this._end.set(this._pos.x + this._dir.x * range, this._pos.y + this._dir.y * range, this._pos.z + this._dir.z * range);
-        this._tracer.speed = speed;
-        this._tracer.ammo = idx;
-        this._tracer.tracer = AMMO.tracer[idx];
-        this._emit('bullet:tracer', this._tracer);
-        return null;
+        this._end.set(this._pos.x + this._dir.x * range, this._pos.y + this._dir.y * range, this._pos.z + this._dir.z * range)
+        this._tracer.speed = speed
+        this._tracer.ammo = idx
+        this._tracer.tracer = AMMO.tracer[idx]
+        this._emit('bullet:tracer', this._tracer)
+        return null
       }
 
-      const si = hit.surface >= 0 && hit.surface < SURF_N ? hit.surface : 0;
-      travelled += hit.distance;
-      range -= hit.distance;
+      const si = hit.surface >= 0 && hit.surface < SURF_N ? hit.surface : 0
+      travelled += hit.distance
+      range -= hit.distance
 
       /* Трассер до точки попадания. */
-      this._end.set(hit.point.x, hit.point.y, hit.point.z);
-      this._tracer.speed = speed;
-      this._tracer.ammo = idx;
-      this._tracer.tracer = AMMO.tracer[idx];
-      this._emit('bullet:tracer', this._tracer);
+      this._end.set(hit.point.x, hit.point.y, hit.point.z)
+      this._tracer.speed = speed
+      this._tracer.ammo = idx
+      this._tracer.tracer = AMMO.tracer[idx]
+      this._emit('bullet:tracer', this._tracer)
 
       /* Падение урона с дистанцией: не ниже 55 процентов на предельной дальности. */
-      const falloff = travelled > 40 ? Math.max(0.55, 1 - (travelled - 40) / 700) : 1;
+      const falloff = travelled > 40 ? Math.max(0.55, 1 - (travelled - 40) / 700) : 1
 
       /* Скалярное произведение направления и нормали: без создания векторов. */
-      const dx = this._dir.x;
-      const dy = this._dir.y;
-      const dz = this._dir.z;
-      let nx = hit.normal.x;
-      let ny = hit.normal.y;
-      let nz = hit.normal.z;
-      let dot = dx * nx + dy * ny + dz * nz;
+      const dx = this._dir.x
+      const dy = this._dir.y
+      const dz = this._dir.z
+      let nx = hit.normal.x
+      let ny = hit.normal.y
+      let nz = hit.normal.z
+      let dot = dx * nx + dy * ny + dz * nz
       if (dot > 0) {
-        nx = -nx;
-        ny = -ny;
-        nz = -nz;
-        dot = -dot;
+        nx = -nx
+        ny = -ny
+        nz = -nz
+        dot = -dot
       }
-      const cosI = -dot;
+      const cosI = -dot
 
-      this._inc.set(dx, dy, dz);
-      imp.surfaceIndex = si;
-      imp.surface = SURFACE_ORDER[si];
-      imp.ammo = idx;
-      imp.distance = travelled;
-      imp.ricochet = false;
-      imp.fragment = false;
-      imp.penetrated = false;
-      imp.armorDamage = 0;
-      imp.target = null;
-      imp.partIndex = hit.partIndex;
+      this._inc.set(dx, dy, dz)
+      imp.surfaceIndex = si
+      imp.surface = SURFACE_ORDER[si]
+      imp.ammo = idx
+      imp.distance = travelled
+      imp.ricochet = false
+      imp.fragment = false
+      imp.penetrated = false
+      imp.armorDamage = 0
+      imp.target = null
+      imp.partIndex = hit.partIndex
+      imp.zone = null
+      imp.subZone = null
+      imp.healthPart = null
+      imp.armorBlocked = false
+      imp.armorPenetrated = false
+      imp.armorClass = 0
+      imp.armorItem = null
+      imp.armorDurability = 0
 
       /* ---------- Попадание в актора ---------- */
       if (hit.actor) {
-        this.stats.hits++;
-        const armor = this._armorOf(hit.actor, hit.partIndex);
-        let dealt = damage * falloff;
-        let armorDmg = 0;
+        this.stats.hits++
 
-        if (armor > 0) {
-          const need = armor * 10;
-          if (pen >= need) {
-            dealt *= 0.9;
-            armorDmg = AMMO.armorDamage[idx] * 0.4;
-            pen -= need * 0.35;
+        /*
+         * Зона приходит с самой капсулы (userData.zone), а не угадывается по
+         * индексу: капсулы помечает Agent/Player через core/anatomy.js.
+         * Индекс остаётся страховкой для капсул из старых сборок.
+         */
+        const ud = hit.object && hit.object.userData ? hit.object.userData : null
+        const zone = ud && ud.zone ? ud.zone : zoneForPartIndex(hit.partIndex)
+        const subZone = zone === 'head' ? pickHeadSubZone(this.armorRng()) : null
+
+        imp.zone = zone
+        imp.subZone = subZone
+        imp.healthPart = healthPartOf(zone)
+
+        let dealt = damage * falloff
+        let armorDmg = 0
+        const worn = this.armor.resolve(hit.actor, zone, subZone)
+
+        if (worn !== null) {
+          const it = worn.item
+          const adef = worn.def
+          const durPct = it.durMax > 0 ? (it.dur / it.durMax) * 100 : 0
+          const chance = armorPenetrationChance(pen, adef.armorClass, durPct)
+          const penetrated = this.armorRng() < chance
+          const durBefore = it.dur
+
+          /* durLoss = penPower * ammoArmorDamagePercent * materialFactor / 100 */
+          const loss = armorDurabilityLoss(pen, AMMO.armorDamage[idx], adef.material, penetrated)
+          let after = durBefore - loss
+          if (after < 0) after = 0
+          /* ЗАПИСЬ ОБРАТНО В ЭКЗЕМПЛЯР. Ровно этого не делала старая версия. */
+          it.dur = after
+          armorDmg = durBefore - after
+
+          if (penetrated) {
+            /* ПРОБИЛА: канонические 20 процентов долой с базового урона. */
+            dealt = damage * ARMOR_PEN_DAMAGE * falloff
+            pen -= adef.armorClass * PEN_CURVE.classStep * 0.35
+            if (pen < 0) pen = 0
+            imp.armorPenetrated = true
+            this.stats.armorPens++
           } else {
-            const k = pen / need;
-            dealt *= 0.15 + 0.6 * k;
-            armorDmg = AMMO.armorDamage[idx];
-            pen *= 0.4;
+            /* НЕ ПРОБИЛА: за плиту проходит только заброневая контузия. */
+            dealt = damage * adef.bluntThroughput * falloff
+            pen = 0
+            imp.armorBlocked = true
+            this.stats.armorBlocks++
           }
+
+          imp.armorClass = adef.armorClass
+          imp.armorItem = it
+          imp.armorDurability = after
+
+          this._armorEvent.item = it
+          this._armorEvent.def = adef
+          this._armorEvent.zone = zone
+          this._armorEvent.subZone = subZone
+          this._armorEvent.durBefore = durBefore
+          this._armorEvent.durAfter = after
+          this._armorEvent.durMax = it.durMax
+          this._armorEvent.penetrated = penetrated
+          this._armorEvent.chance = chance
+          this._armorEvent.material = adef.material
+          this._armorEvent.armorClass = adef.armorClass
+          this._armorEvent.target = hit.actor
+          this._armorEvent.ammo = idx
+          this._armorEvent.destroyed = after <= 0
+          this._emit('armor:damaged', this._armorEvent)
+        } else {
+          imp.armorPenetrated = true
         }
 
-        if (AMMO.fragChance[idx] > 0 && this.rng() < AMMO.fragChance[idx]) {
-          dealt *= 1.35;
-          imp.fragment = true;
+        /* Фрагментация — только по мясу: в плите осколки не образуются. */
+        if (!imp.armorBlocked && AMMO.fragChance[idx] > 0 && this.rng() < AMMO.fragChance[idx]) {
+          dealt *= 1.35
+          imp.fragment = true
         }
 
-        this._deal(hit.actor, dealt, hit.partIndex, shooter, idx, armorDmg);
+        this._deal(hit.actor, dealt, hit.partIndex, shooter, idx, armorDmg)
 
-        imp.damage = dealt;
-        imp.armorDamage = armorDmg;
-        imp.target = hit.actor;
-        this._emit('bullet:impact', imp);
+        imp.damage = dealt
+        imp.armorDamage = armorDmg
+        imp.target = hit.actor
+        this._emit('bullet:impact', imp)
+
+        /* Пуля осталась в плите: сквозного канала нет. */
+        if (imp.armorBlocked) return imp
 
         /* Сквозное пробитие тела. */
-        const fleshCost = PEN_COST[FLESH];
-        if (pen <= fleshCost || imp.fragment) return imp;
-        pen -= fleshCost;
-        damage = dealt * SURFACE.pass[FLESH];
-        this._pos.set(hit.point.x + dx * (THICK[FLESH] + SKIN), hit.point.y + dy * (THICK[FLESH] + SKIN), hit.point.z + dz * (THICK[FLESH] + SKIN));
-        range -= THICK[FLESH] + SKIN;
-        this._from.set(this._pos.x, this._pos.y, this._pos.z);
-        continue;
+        const fleshCost = PEN_COST[FLESH]
+        if (pen <= fleshCost || imp.fragment) return imp
+        pen -= fleshCost
+        damage = dealt * SURFACE.pass[FLESH]
+        this._pos.set(hit.point.x + dx * (THICK[FLESH] + SKIN), hit.point.y + dy * (THICK[FLESH] + SKIN), hit.point.z + dz * (THICK[FLESH] + SKIN))
+        range -= THICK[FLESH] + SKIN
+        this._from.set(this._pos.x, this._pos.y, this._pos.z)
+        continue
       }
 
       /* ---------- Рикошет ---------- */
-      const ricChance = SURFACE.ric[si] * AMMO.ricochet[idx] * 4;
+      const ricChance = SURFACE.ric[si] * AMMO.ricochet[idx] * 4
       if (cosI < SURFACE.ang[si] && ricChance > 0 && this.rng() < ricChance) {
-        this.stats.ricochets++;
-        imp.ricochet = true;
-        imp.damage = damage * falloff * 0.35;
-        this._emit('bullet:impact', imp);
+        this.stats.ricochets++
+        imp.ricochet = true
+        imp.damage = damage * falloff * 0.35
+        this._emit('bullet:impact', imp)
 
         /* Отражение d - 2(d·n)n с небольшим разбросом. */
-        const k = 2 * dot;
-        let rx = dx - k * nx + (this.rng() - 0.5) * 0.12;
-        let ry = dy - k * ny + (this.rng() - 0.5) * 0.12;
-        let rz = dz - k * nz + (this.rng() - 0.5) * 0.12;
-        const rl = Math.sqrt(rx * rx + ry * ry + rz * rz);
-        if (rl < 1e-6) return imp;
-        const rinv = 1 / rl;
-        rx *= rinv;
-        ry *= rinv;
-        rz *= rinv;
-        this._dir.set(rx, ry, rz);
-        damage *= 0.55;
-        pen *= 0.5;
-        this._pos.set(hit.point.x + rx * SKIN, hit.point.y + ry * SKIN, hit.point.z + rz * SKIN);
-        this._from.set(this._pos.x, this._pos.y, this._pos.z);
-        continue;
+        const k = 2 * dot
+        let rx = dx - k * nx + (this.rng() - 0.5) * 0.12
+        let ry = dy - k * ny + (this.rng() - 0.5) * 0.12
+        let rz = dz - k * nz + (this.rng() - 0.5) * 0.12
+        const rl = Math.sqrt(rx * rx + ry * ry + rz * rz)
+        if (rl < 1e-6) return imp
+        const rinv = 1 / rl
+        rx *= rinv
+        ry *= rinv
+        rz *= rinv
+        this._dir.set(rx, ry, rz)
+        damage *= 0.55
+        pen *= 0.5
+        this._pos.set(hit.point.x + rx * SKIN, hit.point.y + ry * SKIN, hit.point.z + rz * SKIN)
+        this._from.set(this._pos.x, this._pos.y, this._pos.z)
+        continue
       }
 
       /* ---------- Пробитие или застревание ---------- */
       /* Косой вход увеличивает эффективную толщину. */
-      const obliquity = cosI > 0.15 ? 1 / cosI : 6.6667;
-      const cost = PEN_COST[si] * obliquity;
+      const obliquity = cosI > 0.15 ? 1 / cosI : 6.6667
+      const cost = PEN_COST[si] * obliquity
 
       if (pen > cost) {
-        this.stats.penetrations++;
-        imp.penetrated = true;
-        imp.damage = damage * falloff;
-        this._emit('bullet:impact', imp);
+        this.stats.penetrations++
+        imp.penetrated = true
+        imp.damage = damage * falloff
+        this._emit('bullet:impact', imp)
 
-        pen -= cost;
-        damage *= SURFACE.pass[si];
-        const step = THICK[si] * obliquity + SKIN;
-        this._pos.set(hit.point.x + dx * step, hit.point.y + dy * step, hit.point.z + dz * step);
-        range -= step;
-        this._from.set(this._pos.x, this._pos.y, this._pos.z);
-        continue;
+        pen -= cost
+        damage *= SURFACE.pass[si]
+        const step = THICK[si] * obliquity + SKIN
+        this._pos.set(hit.point.x + dx * step, hit.point.y + dy * step, hit.point.z + dz * step)
+        range -= step
+        this._from.set(this._pos.x, this._pos.y, this._pos.z)
+        continue
       }
 
-      imp.penetrated = false;
-      imp.damage = damage * falloff;
-      this._emit('bullet:impact', imp);
-      return imp;
+      imp.penetrated = false
+      imp.damage = damage * falloff
+      this._emit('bullet:impact', imp)
+      return imp
     }
 
-    return null;
+    return null
   }
 
   dispose() {
-    this.physics = null;
-    this.ctx = null;
-    this._cast = buildCast(null);
+    this.physics = null
+    this.ctx = null
+    this.armor?.dispose()
+    this._cast = buildCast(null)
   }
 }
 
 /* Фабрика для PhysicsSystem.init(). */
 export function createPenetrationSolver(physics, ctx) {
-  return new PenetrationSolver(physics, ctx);
+  return new PenetrationSolver(physics, ctx)
 }
 
-export default PenetrationSolver;
+export default PenetrationSolver
 
 export class Ballistics {
   constructor(physics) {
-    this.physics = physics;
-    this.rng = null;
+    this.physics = physics
+    this.rng = null
     // Преаллоцированный пул попаданий для пули, чтобы не создавать объекты в кадре
-    this.impacts = [];
+    this.impacts = []
     for (let i = 0; i < 16; i++) {
       this.impacts.push({
         point: new THREE.Vector3(),
@@ -591,20 +716,20 @@ export class Ballistics {
         damage: 0,
         armorDamage: 0,
         penetrated: false,
-      });
+      })
     }
   }
 
   fire(opts) {
-    if (!this.rng) this.rng = opts.rng;
+    if (!this.rng) this.rng = opts.rng
     // Базовая заглушка вызова баллистического солвера для пуль/дроби
-    const origin = opts.origin;
-    const dir = opts.dir;
-    const ammoIdx = opts.ammoIndex ?? 0;
+    const origin = opts.origin
+    const dir = opts.dir
+    const ammoIdx = opts.ammoIndex ?? 0
 
     if (this.physics._solver) {
-      return this.physics._solver.solve(origin, dir, ammoIdx, opts.shooter);
+      return this.physics._solver.solve(origin, dir, ammoIdx, opts.shooter)
     }
-    return 0;
+    return 0
   }
 }
