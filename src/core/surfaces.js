@@ -14,7 +14,10 @@
  *      IS the wire format for collider tags and for every Float32Array below.
  *   2. A new tag must declare where its physical data comes from, either as
  *      its own row in the BASE_* tables or as a DERIVED_FROM collapse target.
- *   3. Nothing here imports another subsystem. This file sits under src/core/
+ *   3. A non-canonical name used by map geometry must be declared in
+ *      SURFACE_ALIASES. An undeclared name is a live shader-recompilation
+ *      trap, not a cosmetic warning — see the comment on that table.
+ *   4. Nothing here imports another subsystem. This file sits under src/core/
  *      precisely so physics, items, materials and world can all depend on it
  *      without depending on each other.
  */
@@ -57,6 +60,45 @@ for (let i = 0; i < SURFACE_NAMES.length; i++) indexOfName[SURFACE_NAMES[i]] = i
 
 /** name -> canonical index. Frozen: nobody gets to add a 21st tag at runtime. */
 export const SURFACE = Object.freeze(indexOfName)
+
+/**
+ * Non-canonical names that shipped map geometry actually uses.
+ *
+ * These reached MaterialSystem._resolve() as unknown surfaces on every map
+ * build. The fallback to concrete looks harmless in the console, but the
+ * material cache is keyed by the requested name, so each miss produced a new
+ * cache entry and the renderer compiled a fresh program for geometry it had
+ * already compiled — a permanent recompilation loop during deployment.
+ *
+ * Declared here rather than in the material library because a name that map
+ * geometry can carry is a surface question first (physics, ballistics, impact
+ * FX and footsteps all read it) and a shading question second.
+ *
+ *   kerb  -> concrete    kerbstone is cast concrete, not road tarmac
+ *   rail  -> metal_thin  handrail and balustrade tube, thin pressed steel
+ *   pipe  -> metal       structural steel pipework
+ *   lamp  -> glass       a lamp reads as its diffuser, not as its bracket
+ *   water -> water       already canonical; listed so the lookup is total
+ */
+export const SURFACE_ALIASES = Object.freeze({
+	kerb: 'concrete',
+	curb: 'concrete',
+	kerbstone: 'concrete',
+	rail: 'metal_thin',
+	rails: 'metal_thin',
+	railing: 'metal_thin',
+	handrail: 'metal_thin',
+	balustrade: 'metal_thin',
+	pipe: 'metal',
+	pipes: 'metal',
+	piping: 'metal',
+	lamp: 'glass',
+	lamps: 'glass',
+	lamppost: 'glass',
+	streetlamp: 'glass',
+	water: 'water',
+	puddle: 'water'
+})
 
 /**
  * Where the physical data for each new tag comes from.
@@ -182,6 +224,14 @@ function listOf(byName) {
 	return Object.freeze(out)
 }
 
+/* An alias that points at nothing is the exact failure this table exists to
+ * prevent, so it is a boot failure and not a runtime warning. */
+for (const alias in SURFACE_ALIASES) {
+	if (SURFACE[SURFACE_ALIASES[alias]] === undefined) {
+		throw new Error('[surfaces] alias "' + alias + '" points at unknown tag "' + SURFACE_ALIASES[alias] + '"')
+	}
+}
+
 /** Physical response by tag name, all 20 present. */
 export const SURFACE_PROPS_BY_NAME = expand(BASE_PROPS, 'SURFACE_PROPS')
 
@@ -245,6 +295,23 @@ export function isSurface(name) {
 }
 
 /**
+ * Canonical tag for a canonical name or a declared alias, else null.
+ *
+ * This is the total, allocation-free lookup every other subsystem should use
+ * before it falls back to guessing: null means "nobody declared this name",
+ * which is a content bug worth reporting once, not a name to cache a material
+ * under.
+ */
+export function resolveSurfaceAlias(name) {
+	if (typeof name !== 'string' || name.length === 0) return null
+	if (SURFACE[name] !== undefined) return name
+	const key = name.toLowerCase()
+	if (SURFACE[key] !== undefined) return key
+	const alias = SURFACE_ALIASES[key]
+	return alias === undefined ? null : alias
+}
+
+/**
  * Best-effort surface inference from a mesh or material name.
  *
  * Ordered specific -> generic: `grate` has to win over `metal`, `bark` over
@@ -254,15 +321,19 @@ export function isSurface(name) {
 const GUESS = [
 	[/grate|grating|catwalk|duckboard/i, 'grate'],
 	[/metal_thin|thin_metal|sheet_?metal|corrugat|locker|ducting|duct|vent|tin_/i, 'metal_thin'],
+	[/kerb|curb/i, 'concrete'],
+	[/handrail|balustrade|railing|guardrail/i, 'metal_thin'],
+	[/pipe|piping/i, 'metal'],
+	[/lamppost|streetlamp|lamp/i, 'glass'],
 	[/brick|masonry/i, 'brick'],
 	[/tile|tiling|ceramic|porcelain/i, 'tile'],
-	[/asphalt|tarmac|road|kerb|curb/i, 'asphalt'],
+	[/asphalt|tarmac|road/i, 'asphalt'],
 	[/gravel|shingle|ballast|rubble/i, 'gravel'],
 	[/grass|lawn|turf|meadow/i, 'grass'],
 	[/bark|trunk|stump/i, 'bark'],
 	[/plaster|drywall|gypsum|stucco|wall|ceiling|partition/i, 'plaster'],
 	[/concrete|cement|stone|rock|marble|barrier/i, 'concrete'],
-	[/metal|steel|iron|alu|aluminium|aluminum|pipe|rail|car|vehicle|chassis|barrel|drum|sign/i, 'metal'],
+	[/metal|steel|iron|alu|aluminium|aluminum|rail|car|vehicle|chassis|barrel|drum|sign/i, 'metal'],
 	[/wood|timber|plank|crate|pallet|door|plywood|fence|log|furnit/i, 'wood'],
 	[/dirt|mud|soil|earth|ground|terrain/i, 'dirt'],
 	[/sand|dune|beach/i, 'sand'],
@@ -277,6 +348,10 @@ const GUESS = [
 /** Infer a canonical index from a mesh/material name. */
 export function guessSurface(name, fallback = SURFACE.concrete) {
 	if (!name) return fallback
+	/* A declared name never goes through the regex ladder: the ladder is a
+	 * heuristic and the alias table is a decision. */
+	const canon = resolveSurfaceAlias(name)
+	if (canon !== null) return SURFACE[canon]
 	for (let i = 0; i < GUESS.length; i++) {
 		if (GUESS[i][0].test(name)) return SURFACE[GUESS[i][1]]
 	}
@@ -287,8 +362,8 @@ export function guessSurface(name, fallback = SURFACE.concrete) {
 export function surfaceIndex(s, fallback = SURFACE.concrete) {
 	if (typeof s === 'number') return s >= 0 && s < SURFACE_NAMES.length ? s | 0 : fallback
 	if (typeof s === 'string') {
-		const i = SURFACE[s]
-		if (i !== undefined) return i
+		const canon = resolveSurfaceAlias(s)
+		if (canon !== null) return SURFACE[canon]
 		return guessSurface(s, fallback)
 	}
 	return fallback
@@ -299,7 +374,12 @@ export function surfaceName(i) {
 	return SURFACE_NAMES[i] ?? 'concrete'
 }
 
-/** Nearest material library key for a canonical tag, or null if unknown. */
+/**
+ * Nearest material library key for a canonical tag or a declared alias, or
+ * null if the name was never declared anywhere.
+ */
 export function surfaceMaterial(name) {
+	const canon = resolveSurfaceAlias(name)
+	if (canon !== null) return SURFACE_MATERIAL[canon] ?? null
 	return SURFACE_MATERIAL[name] ?? null
 }
