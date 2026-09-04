@@ -20,17 +20,35 @@
  * Все три вещи детерминированно вызываются здесь, пока на экране висит
  * «ЗАГРУЗКА ДАННЫХ...».
  *
+ * КАДРЫ. Сам прогрев не имеет права быть стопом. Три источника семисекундной
+ * заморозки высадки убраны:
+ *
+ *   1. синхронный renderer.compile() на две сцены — теперь compileAsync();
+ *   2. WebGLRenderTarget 1x1, который создавался и уничтожался N+2 раза за
+ *      высадку, — теперь синглтон RenderSystem (render/scratchTarget.js),
+ *      живущий до Engine.dispose();
+ *   3. пакетная выпечка текстур материалов, шедшая одним куском внутри
+ *      одного кадра, — теперь генератор MaterialSystem.bakeAll(), который
+ *      отдаёт кадр браузеру и двигает ползунок загрузки.
+ *
+ * Выпечка идёт в стадии «ландшафт» ДО afterTerrain(), то есть до
+ * world.buildMap(): карта строится уже по готовым текстурам и не заказывает
+ * их по одной посреди сборки геометрии.
+ *
  * КОНТРАКТ ЧИСТОТЫ. Прогрев обязан быть прозрачным для симуляции: он
  * шагает вьюмодель и трогает пулы частиц, а это двигает и часы, и поток
  * RNG. Снимок и восстановление — ровно как в core/prewarm.js, иначе
  * lockstep-съёмка в dev/shots.js разъедется.
  * ========================================================================== */
 
-import * as THREE from 'three'
 import { spawnTracer } from '../fx/tracers.js'
+import { scratchTarget } from '../render/scratchTarget.js'
 
 /** Сколько трассеров прогнать, чтобы пул частиц вырос до боевого размера. */
 const TRACER_WARM_SHOTS = 24
+
+/** Какую долю стадии «ландшафт» занимает выпечка материалов на ползунке. */
+const BAKE_PROGRESS_SHARE = 0.7
 
 /** Состояние, которым кормим Viewmodel.update() на прогреве. */
 const WARM_VM_STATES = [
@@ -66,6 +84,14 @@ function nextFrame() {
 		return new Promise((resolve) => requestAnimationFrame(() => resolve()))
 	}
 	return new Promise((resolve) => setTimeout(resolve, 16))
+}
+
+function clamp01(t) {
+	const v = Number(t)
+	if (!Number.isFinite(v)) return 0
+	if (v < 0) return 0
+	if (v > 1) return 1
+	return v
 }
 
 /**
@@ -122,6 +148,25 @@ function snapshot(engine) {
 }
 
 /**
+ * Одна сцена, асинхронно.
+ *
+ * renderer.compile() линкует все программы сцены в текущем кадре: на карте
+ * рейда это те самые 2443ms в одном rAF-обработчике. compileAsync() отдаёт
+ * промис и опрашивает KHR_parallel_shader_compile, поэтому браузер успевает
+ * нарисовать экран загрузки между программами. Синхронный compile() остаётся
+ * запасным путём для three без compileAsync и для headless-харнесса.
+ */
+async function compileScene(renderer, scene, camera) {
+	if (!scene || !camera) return false
+	if (typeof renderer.compileAsync === 'function') {
+		await renderer.compileAsync(scene, camera)
+		return true
+	}
+	renderer.compile(scene, camera)
+	return true
+}
+
+/**
  * Компиляция обеих сцен с ПРИВЯЗАННЫМ render target.
  *
  * three складывает outputColorSpace и toneMapping в ключ кэша программы и
@@ -129,28 +174,70 @@ function snapshot(engine) {
  * tonemapped варианты, а мир и вьюмодель рисуются в HDR-таргеты, которым
  * нужны srgb-linear + NoToneMapping. Мерено в core/prewarm.js: без этого
  * половина прогретых программ — мусор. Хватает цели 1x1.
+ *
+ * Цель больше НЕ создаётся здесь. Она принадлежит RenderSystem и переживает
+ * всю сессию: раньше на одну высадку приходилось N+2 пары new/dispose, то
+ * есть N+2 создания и удаления FBO в драйвере посреди кадра прогрева.
+ *
+ * Ошибка компиляции не бросается наружу: прогрев стоит между экраном высадки
+ * и STATE.GAMEPLAY, и исключение отсюда навсегда вешало бы загрузку. Она
+ * уезжает в сводку.
  */
-async function compileScenes(engine, renderer) {
-	const scratch = new THREE.WebGLRenderTarget(1, 1, { depthBuffer: false, stencilBuffer: false })
+async function compileScenes(engine, render, renderer) {
+	const out = { ok: true, world: false, view: false }
+	const scratch = scratchTarget(render)
 	const prevRt = renderer.getRenderTarget()
 	const prevFace = typeof renderer.getActiveCubeFace === 'function' ? renderer.getActiveCubeFace() : 0
 	const prevMip = typeof renderer.getActiveMipmapLevel === 'function' ? renderer.getActiveMipmapLevel() : 0
 	try {
-		renderer.setRenderTarget(scratch)
+		if (scratch) renderer.setRenderTarget(scratch)
 		try {
-			renderer.compile(engine.scene, engine.camera)
+			out.world = await compileScene(renderer, engine.scene, engine.camera)
 		} catch (err) {
-			/* компиляция мира не должна валить высадку */
+			out.ok = false
+			out.world = String((err && err.message) || err)
 		}
 		try {
-			renderer.compile(engine.viewScene, engine.viewCamera)
+			out.view = await compileScene(renderer, engine.viewScene, engine.viewCamera)
 		} catch (err) {
-			/* то же для вьюмодели */
+			out.ok = false
+			out.view = String((err && err.message) || err)
 		}
 	} finally {
 		renderer.setRenderTarget(prevRt, prevFace, prevMip)
-		scratch.dispose()
 	}
+	return out
+}
+
+/**
+ * Выпечка текстур библиотеки материалов покадрово.
+ *
+ * Идёт ДО world.buildMap(): карта должна собираться по готовым наборам, а не
+ * заказывать выпечку по одной поверхности посреди сборки геометрии. Прогресс
+ * уходит прямо в ползунок визарда — это и есть замена «мёртвых» семи секунд.
+ */
+async function bakeMaterials(engine, onProgress) {
+	const materials = sys(engine, 'materials')
+	if (!materials || typeof materials.bakeAll !== 'function') {
+		return { ok: false, reason: 'no materials system' }
+	}
+	const names = typeof materials.names === 'function' ? materials.names() : []
+	const out = { ok: true, baked: 0, cached: 0, total: names.length, ms: 0, slowest: '' }
+	if (!names.length) return out
+
+	const t0 = performance.now()
+	let worst = 0
+	for await (const step of materials.bakeAll(names, { onProgress })) {
+		out.baked++
+		if (step.cached) out.cached++
+		if (step.ms > worst) {
+			worst = step.ms
+			out.slowest = step.name
+		}
+	}
+	out.ms = Math.round(performance.now() - t0)
+	out.slowestMs = Math.round(worst)
+	return out
 }
 
 /**
@@ -161,7 +248,7 @@ async function compileScenes(engine, renderer) {
  * компилируются только когда она впервые попадает в кадр. Активный ствол
  * восстанавливается в конце, чтобы игрок вошёл в рейд с тем, что выбрал.
  */
-async function warmViewmodels(engine, renderer) {
+async function warmViewmodels(engine, render, renderer) {
 	const weapons = sys(engine, 'weapons')
 	const vm = weapons && weapons.viewmodel
 	if (!vm || !vm.weapons || typeof vm.setActive !== 'function') return { ok: false, reason: 'no viewmodel' }
@@ -183,7 +270,7 @@ async function warmViewmodels(engine, renderer) {
 				}
 				const entry = vm.weapons.get(id)
 				if (entry && entry.group) entry.group.updateMatrixWorld(true)
-				await compileScenes(engine, renderer)
+				await compileScenes(engine, render, renderer)
 				warmed++
 			} catch (err) {
 				/* один набор мешей не должен валить остальные */
@@ -303,9 +390,10 @@ async function runMaterialHooks(engine) {
 export async function runRaidPrewarm(engine, opts) {
 	const o = opts || {}
 	const onStage = typeof o.onStage === 'function' ? o.onStage : () => {}
-	const onProgress = typeof o.onProgress === 'function' ? o.onProgress : () => {}
+	const rawProgress = typeof o.onProgress === 'function' ? o.onProgress : () => {}
+	const onProgress = (t) => rawProgress(clamp01(t))
 	const t0 = performance.now()
-	const summary = { ok: false, ms: 0, stages: {}, compiled: 0, tracers: 0, weapons: 0 }
+	const summary = { ok: false, ms: 0, stages: {}, compiled: 0, tracers: 0, weapons: 0, baked: 0 }
 
 	if (!engine) return summary
 
@@ -318,11 +406,12 @@ export async function runRaidPrewarm(engine, opts) {
 	let index = 0
 	const enter = async (id) => {
 		const stage = STAGES.find((s) => s.id === id) || { id, label: id }
-		onStage(stage.id, stage.label, index, total)
-		onProgress(index / total)
+		const at = index
+		onStage(stage.id, stage.label, at, total)
+		onProgress(at / total)
 		index++
 		await nextFrame()
-		return stage
+		return { id: stage.id, label: stage.label, base: at / total, slice: 1 / total }
 	}
 
 	try {
@@ -331,8 +420,17 @@ export async function runRaidPrewarm(engine, opts) {
 		const inv = sys(engine, 'inventory')
 		summary.stages.profile = { ok: !!inv, items: inv && inv.all ? inv.all.length : 0 }
 
-		/* 2. Ландшафт: колбэк визарда строит карту рейда. */
-		await enter('terrain')
+		/* 2. Ландшафт: сначала покадровая выпечка материалов, потом колбэк
+		 *    визарда, который строит карту рейда. Порядок принципиален —
+		 *    buildMap() должен получить уже готовые наборы текстур. */
+		const terrain = await enter('terrain')
+		const bake = await bakeMaterials(engine, (t) => {
+			onProgress(terrain.base + terrain.slice * BAKE_PROGRESS_SHARE * clamp01(t))
+		})
+		summary.stages.materials = bake
+		summary.baked = bake.baked || 0
+		onProgress(terrain.base + terrain.slice * BAKE_PROGRESS_SHARE)
+
 		if (typeof o.afterTerrain === 'function') {
 			try {
 				summary.stages.terrain = (await o.afterTerrain()) || { ok: true }
@@ -344,11 +442,11 @@ export async function runRaidPrewarm(engine, opts) {
 			summary.stages.terrain = { ok: true, skipped: true }
 		}
 
-		/* 3. Шейдеры: хуки подсистем + компиляция обеих сцен. */
+		/* 3. Шейдеры: хуки подсистем + асинхронная компиляция обеих сцен. */
 		await enter('shaders')
 		if (renderer) {
 			summary.stages.shaders = await runMaterialHooks(engine)
-			await compileScenes(engine, renderer)
+			summary.stages.shaders.compile = await compileScenes(engine, render, renderer)
 		} else {
 			summary.stages.shaders = { ok: false, reason: 'no renderer' }
 		}
@@ -356,7 +454,7 @@ export async function runRaidPrewarm(engine, opts) {
 		/* 4. Меши оружия. */
 		await enter('weapons')
 		if (renderer) {
-			const res = await warmViewmodels(engine, renderer)
+			const res = await warmViewmodels(engine, render, renderer)
 			summary.stages.weapons = res
 			summary.weapons = res.warmed || 0
 		} else {
@@ -391,8 +489,8 @@ export async function runRaidPrewarm(engine, opts) {
 
 		/* 7. Последняя компиляция уже с реальным стволом в руках. */
 		await enter('deploy')
-		if (renderer) await compileScenes(engine, renderer)
-		summary.stages.deploy = { ok: true }
+		if (renderer) summary.stages.deploy = await compileScenes(engine, render, renderer)
+		else summary.stages.deploy = { ok: true, skipped: true }
 
 		onProgress(1)
 		summary.ok = true

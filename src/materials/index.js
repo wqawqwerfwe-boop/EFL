@@ -3,6 +3,7 @@ import { TextureForge } from './generator.js';
 import { LIBRARY, resolveName } from './library.js';
 import { extendMaterial, DEFAULT_PARAMS } from './shader.js';
 import { bakeMasks, setMask } from './masks.js';
+import { resolveSurfaceAlias, surfaceMaterial } from '../core/surfaces.js';
 
 /**
  * Procedural PBR texture generation and the shared material library.
@@ -17,6 +18,8 @@ import { bakeMasks, setMask } from './masks.js';
  *
  *   get(name, opts?)          -> THREE.Material (cached; same opts, same instance)
  *   getTextureSet(name, opts?)-> { albedo, normal, orm, size, worldSize }
+ *   bakeAll(names, opts?)     -> async generator, one surface per step, yields
+ *                                to requestAnimationFrame between frames
  *   variant(name, opts)       -> alias for get() with a fresh cache entry
  *   names()                   -> string[]
  *   surfaceOf(name)           -> one of the ARCHITECTURE.md surface tags
@@ -28,6 +31,25 @@ import { bakeMasks, setMask } from './masks.js';
  * weather, …) plus `three` for raw THREE material properties and `bake` to
  * force a distinct texture bake (a different paint colour, for example).
  */
+
+/**
+ * How long one bake frame may run before bakeAll() hands the frame back.
+ *
+ * A single 1K surface costs 8-25 ms on the reference machine, so the budget is
+ * deliberately smaller than one bake: the check is "have I already spent a
+ * frame's worth of time", and the next surface always starts on a fresh frame.
+ * That is what turns an 18-surface burst from one 4.5-second rAF violation
+ * into eighteen ordinary frames with a moving progress bar.
+ */
+const BAKE_FRAME_BUDGET_MS = 6;
+
+function nextFrame() {
+  if (typeof requestAnimationFrame === 'function') {
+    return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  }
+  return new Promise((resolve) => setTimeout(resolve, 16));
+}
+
 export class MaterialSystem {
   static id = 'materials';
   static deps = ['render'];
@@ -37,6 +59,7 @@ export class MaterialSystem {
     this._injectedRenderer = opts.renderer ?? null;
     this._sets = new Map(); // bakeKey -> texture set
     this._materials = new Map(); // matKey  -> THREE.Material
+    this._resolved = new Map(); // requested name -> library key
     this._forge = null;
     this._shared = null;
     this._groundY = 0;
@@ -46,6 +69,8 @@ export class MaterialSystem {
     /** seconds since the last bake, for the scratch-target release below */
     this._idle = 0;
     this._scratchFreed = false;
+    /** guards against two overlapping bakeAll() drives (wizard re-entry) */
+    this._baking = false;
   }
 
   async init(ctx) {
@@ -99,18 +124,51 @@ export class MaterialSystem {
   }
 
   /**
-   * Names resolve through the alias table. An unknown name warns and falls back
-   * to concrete rather than throwing — a typo in one subsystem must not take
-   * the whole boot down.
+   * Requested name -> library key.
+   *
+   * Three lookups, in order of authority:
+   *   1. the library's own alias table (visual names: `rust`, `tent`, `floor`);
+   *   2. the canonical surface vocabulary in core/surfaces.js, including the
+   *      declared map-geometry aliases — this is what catches `kerb`, `rail`,
+   *      `pipe`, `lamp` and `water`, none of which the library can name because
+   *      there is no kerb shader and no water shader;
+   *   3. concrete, with one warning per distinct name.
+   *
+   * The result is memoised. That is not a micro-optimisation: an unresolved
+   * name used to be cached AS ITSELF by get(), so every deploy produced a new
+   * material key for the same geometry and the renderer recompiled a program
+   * it already had — the permanent recompilation loop this table kills.
    */
   _resolve(name) {
+    const memo = this._resolved.get(name);
+    if (memo !== undefined) return memo;
+
     const key = resolveName(name);
-    if (LIBRARY[key]) return key;
+    if (LIBRARY[key]) {
+      this._resolved.set(name, key);
+      return key;
+    }
+
+    /* Canonical surface tag or declared map alias (kerb, rail, pipe, lamp,
+     * water): surfaceMaterial() answers with the nearest library key. */
+    const canon = resolveSurfaceAlias(name);
+    if (canon !== null) {
+      const mapped = surfaceMaterial(canon);
+      const viaLibrary = mapped ? resolveName(mapped) : null;
+      if (viaLibrary && LIBRARY[viaLibrary]) {
+        this._resolved.set(name, viaLibrary);
+        return viaLibrary;
+      }
+    }
+
     if (!this._missing) this._missing = new Set();
     if (!this._missing.has(name)) {
       this._missing.add(name);
-      console.warn(`[materials] unknown surface "${name}" — falling back to concrete`);
+      console.warn(
+        `[materials] undeclared surface "${name}" — falling back to concrete; declare it in core/surfaces.js SURFACE_ALIASES`
+      );
     }
+    this._resolved.set(name, 'concrete');
     return 'concrete';
   }
 
@@ -153,6 +211,90 @@ export class MaterialSystem {
     return set;
   }
 
+  /** True when this surface already has its packed textures in the cache. */
+  isBaked(name, opts = {}) {
+    if (!this._built) return false;
+    const key = this._resolve(name);
+    const def = LIBRARY[key];
+    if (!def) return false;
+    const bake = { ...def.bake, ...(opts.bake ?? {}) };
+    bake.size = this._size(bake.size);
+    return this._sets.has(this._bakeKey(key, bake));
+  }
+
+  /**
+   * Bake a whole set of surfaces, one per frame, without blocking the browser.
+   *
+   * This is the async, frame-yielded replacement for the burst of synchronous
+   * getTextureSet() calls the raid prewarm used to fire back to back. Every
+   * bake is a full-screen GPU pass plus a Sobel pass plus three texture
+   * uploads; eighteen of them inside one requestAnimationFrame handler is
+   * exactly the `[Violation] 'requestAnimationFrame' handler took 4506ms` the
+   * deployment screen was reporting, and the reason the loading slider sat
+   * frozen for seven seconds.
+   *
+   * Usage — the consumer drives it and gets a step per surface:
+   *
+   *   for await (const step of materials.bakeAll(names, { onProgress })) {
+   *     label.textContent = step.name
+   *   }
+   *
+   * @param {string[]} [names] surfaces to bake; defaults to the whole library
+   * @param {{onProgress?:(t:number)=>void, budgetMs?:number, bake?:object}} [opts]
+   * @yields {{index:number,name:string,key:string,done:number,total:number,t:number,ms:number,cached:boolean}}
+   */
+  async *bakeAll(names, opts = {}) {
+    const list = Array.isArray(names) && names.length ? names.slice() : this.names();
+    const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
+    const total = list.length;
+    if (onProgress) onProgress(0);
+
+    if (!total || !this._tryBuild()) {
+      if (onProgress) onProgress(1);
+      return;
+    }
+    if (this._baking) {
+      /* A second driver would interleave frames with the first and report
+       * nonsense progress. The first one is already baking the same library. */
+      if (onProgress) onProgress(1);
+      return;
+    }
+
+    this._baking = true;
+    const budget = Number.isFinite(opts.budgetMs) && opts.budgetMs > 0 ? opts.budgetMs : BAKE_FRAME_BUDGET_MS;
+    const bakeOpts = opts.bake ? { bake: opts.bake } : {};
+    const t0 = performance.now();
+    let frameStart = performance.now();
+
+    try {
+      for (let i = 0; i < total; i++) {
+        const name = list[i];
+        const key = this._resolve(name);
+        const cached = this.isBaked(name, bakeOpts);
+        const t1 = performance.now();
+        this.getTextureSet(name, bakeOpts);
+        const ms = performance.now() - t1;
+        const done = i + 1;
+        const t = done / total;
+        if (onProgress) onProgress(t);
+        yield { index: i, name, key, done, total, t, ms, cached };
+
+        /* Hand the frame back as soon as this one has had its share of it. A
+         * cached surface costs nothing, so a warm second deploy walks the
+         * whole list in one or two frames instead of eighteen. */
+        if (done < total && performance.now() - frameStart >= budget) {
+          await nextFrame();
+          frameStart = performance.now();
+        }
+      }
+    } finally {
+      this._baking = false;
+      const ms = Math.round(performance.now() - t0);
+      if (ms > 60) console.info(`[materials] bakeAll ${total} surfaces ${ms}ms`);
+      if (onProgress) onProgress(1);
+    }
+  }
+
   /**
    * Every bake happens while the level is loading, but the half-float scratch
    * height targets the Sobel pass reads were being held for the whole session
@@ -164,7 +306,7 @@ export class MaterialSystem {
    * it cannot move a pixel — it only changes when a scratch buffer is freed.
    */
   update(dt) {
-    if (this._scratchFreed || !this._forge) return;
+    if (this._scratchFreed || !this._forge || this._baking) return;
     this._idle += dt > 0.25 ? 0.25 : dt; // ignore load-hitch dt spikes
     if (this._idle < 5) return;
     this._scratchFreed = true;
@@ -236,7 +378,7 @@ export class MaterialSystem {
 
   /** The ARCHITECTURE.md surface tag for impact FX / audio / footsteps. */
   surfaceOf(name) {
-    return LIBRARY[resolveName(name)]?.surface ?? 'concrete';
+    return LIBRARY[this._resolve(name)]?.surface ?? 'concrete';
   }
 
   /** Live-update a material's uniforms after creation. */
@@ -290,10 +432,12 @@ export class MaterialSystem {
     for (const m of this._materials.values()) m.dispose();
     this._materials.clear();
     this._sets.clear();
+    this._resolved.clear();
     this._forge?.dispose();
     this._forge = null;
     this._shared = null;
     this._built = false;
+    this._baking = false;
   }
 }
 
