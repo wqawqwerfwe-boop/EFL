@@ -6,102 +6,41 @@ import { EFL } from '../core/config.js'
  *
  * RaidSystem — жизненный цикл одного рейда: старт, лут, трупы, выходы, финал.
  *
- * ВЫДАЧА КИТА ДИКОГО. Раньше start() безусловно звал this.meta.equipScavKit(),
- * которого в MetaSystem нет ни в одном файле проекта: там есть money/spend,
- * loyalty, buyPrice/sellPrice, deal, insure, keepLoadout/loseLoadout,
- * questProgress, upgrade, tickProduction, addExperience — и ни одной выдачи
- * снаряжения. Любая высадка за Дикого падала на
+ * КИТ ДИКОГО ЗДЕСЬ БОЛЬШЕ НЕ ЖИВЁТ.
  *
- *   TypeError: this.meta.equipScavKit is not a function
+ * История вопроса: сначала start() безусловно звал this.meta.equipScavKit(),
+ * которого в MetaSystem не было, и любая высадка за Дикого падала внутри
+ * afterTerrain-хука преварма. Затем здесь появился META_SCAV_METHODS — список из
+ * семи спекулятивных имён плюс внутренний мок-кит на статических таблицах.
+ * Оба решения были замазкой: баланс экономики лежал в контроллере рейда,
+ * который не видит ни профиля, ни кармы, ни уровня, а каждая выдача
+ * предмета шла в своём try/catch — то есть половина потерь кита просто
+ * молчала.
  *
- * причём падала ВНУТРИ afterTerrain-хука преварма (см. wizard._deploy()).
- * Промис runRaidPrewarm() отклонялся, экран «ВЫСАДКА НА МЕСТО ДИСЛОКАЦИИ»
- * навсегда замирал на текущей стадии, STATE.GAMEPLAY не наступал никогда, и
- * игрок оставался в мёртвом прогреве без единого способа выйти.
+ * Теперь владелец снаряжения — профиль:
  *
- * Теперь выдача идёт через _equipScavLoadout(): сначала ищется реальный метод
- * профиля (любое имя из META_SCAV_METHODS), а если его нет — работает
- * внутренний мок-набор SCAV_*, собранный на существующих id из
- * src/items/index.js. Рейд за Дикого стартует при любом состоянии MetaSystem.
+ *   meta.scavCooldownLeft()          таймер Дикого, проверяется ДО постройки карты
+ *   meta.generateScavLoadout(rng)    дескриптор [uid,id,n,path,x,y,rot,dur]
+ *   inv.applyLoadout(descriptor)     раскладка одной операцией
+ *
+ * Защитных обёрток вокруг выдачи больше нет сознательно. Сломанный кит обязан
+ * падать громко: engine.startRaid() уже ловит исключение из start() и
+ * возвращает игрока в меню, так что молчаливый фолбэк больше ничего не
+ * спасает — он только скрывает баги до прода.
  *
  * Файл сознательно без точек с запятой.
  * ========================================================================== */
-
-/*
- * Имена, под которыми выдача кита Дикого могла бы жить в профиле. Порядок —
- * это приоритет: сначала исторически ожидаемое equipScavKit, потом остальные
- * варианты, которые встречались в задачах и черновиках. Как только настоящий
- * метод появится в MetaSystem под любым из этих имён, RaidSystem подхватит
- * его сам, без правок здесь.
- */
-const META_SCAV_METHODS = [
-  'equipScavKit',
-  'equipScavLoadout',
-  'generateScavLoadout',
-  'rollScavLoadout',
-  'setScavKit',
-  'giveScavKit',
-  'equipStarterKit'
-]
-
-/*
- * Мок-кит Дикого. Ни одного нового предмета не изобретаем: все id взяты из
- * таблицы ITEMS (src/items/index.js), поэтому inv.add() их находит,
- * items.price() считает по ним страховую ценность, а сводка рейда не
- * превращается в NaN.
- */
-
-/* Корпус. Контейнеры идут первыми: именно equip() создаёт гриды 'in:<uid>',
- * в которые падает всё остальное. */
-const SCAV_GEAR = [
-  { id: 'rig_bankrobber', slot: 'rig' },
-  { id: 'backpack_smb', slot: 'backpack' },
-  { id: 'secure_alpha', slot: 'secure' },
-  { id: 'armor_paca', slot: 'armor' },
-  { id: 'helmet_ssh', slot: 'helmet' }
-]
-
-/* Стволы Дикого — ровно те, что лежат в LOOT.gun. */
-const SCAV_GUNS = [
-  { id: 'aks74u', slot: 'primary', mag: 'mag_ak30', magCount: 2, ammo: '545ps', rounds: [40, 90] },
-  { id: 'ak74n', slot: 'primary', mag: 'mag_ak30', magCount: 2, ammo: '545ps', rounds: [30, 60] },
-  { id: 'mp5', slot: 'primary', mag: 'mag_mp5', magCount: 2, ammo: '9x19pst', rounds: [30, 60] },
-  { id: 'm870', slot: 'primary', mag: null, magCount: 0, ammo: '12x70buck', rounds: [12, 28] },
-  { id: 'mosin', slot: 'primary', mag: null, magCount: 0, ammo: '762x54lps', rounds: [10, 20] }
-]
-
-const SCAV_SIDEARM = { id: 'pm', slot: 'holster', mag: 'mag_pm', magCount: 1, ammo: '9x18pmm', rounds: [16, 32] }
-
-/*
- * КАРМАНЫ — ровно четыре позиции 1×1, столько же, сколько ячеек в гриде
- * 'pocket' (4×1). Ничего крупнее сюда не кладём: 'water' 1×2 в карман не
- * влезает и уходит в разгрузку вместе с остальным хабаром.
- */
-const SCAV_POCKETS = [
-  { id: 'bandage', count: [1, 1] },
-  { id: 'analgin', count: [1, 1] },
-  { id: 'crackers', count: [1, 1] },
-  { id: 'rub', count: [4000, 26000] }
-]
-
-/* Хабар в разгрузку и рюкзак. */
-const SCAV_BARTER = [
-  { id: 'water', count: [1, 1] },
-  { id: 'crackers', count: [1, 1] },
-  { id: 'bolts', count: [1, 3] },
-  { id: 'wires', count: [1, 2] }
-]
 
 export class RaidSystem {
   static id = 'raid'
   static deps = ['world', 'inventory', 'items', 'health', 'meta', 'ai', 'ui', 'audio', 'physics']
 
   /* Общий буфер статуса выхода. Раньше exitStatus() писал в this._exitStatus,
-   * которого не существует ни в одном файле проекта. */
+   * которого не существовало ни в одном файле проекта. */
   _exitOut = { open: false, reason: '', progress: 0 }
 
-  /* Откуда пришёл кит Дикого в последней высадке: 'meta:<method>', 'internal'
-   * или 'none'. Нужно и логам, и экрану итогов. */
+  /* Источник кита Дикого в последней высадке. Теперы всегда либо профиль,
+   * либо пустота — внутренних наборов больше нет. */
   _scavKitSource = ''
 
   async init(ctx) {
@@ -158,6 +97,7 @@ export class RaidSystem {
     this.faction = faction
     this.night = !!night
     this.kills = 0
+    this._scavKitSource = ''
     this.summary = {
       kind: '',
       kills: 0,
@@ -170,6 +110,19 @@ export class RaidSystem {
       night: !!night
     }
 
+    const meta = this.ctx.get('meta')
+
+    /*
+     * Таймер Дикого проверяется ДО buildMap(): отказ обязан быть дешёвым.
+     * Исключение ловит engine.startRaid() и возвращает игрока в меню.
+     */
+    if (faction === 'scav') {
+      const left = meta.scavCooldownLeft()
+      if (left > 0) {
+        throw new Error('[EFL/raid] выход за Дикого будет доступен через ' + Math.ceil(left / 1000) + ' с')
+      }
+    }
+
     // строим мир по требованию — вот ради чего world.buildMap асинхронный
     const map = await this.world.buildMap(mapId, { night: this.night, seed })
     this.exits = map.exits
@@ -179,13 +132,16 @@ export class RaidSystem {
     this._scatterLoot(map)
 
     /*
-     * Кит Дикого. Раньше здесь стоял прямой this.meta.equipScavKit(this.rng) —
-     * вызов несуществующего метода, ронявший весь преварм. Теперь выдача
-     * никогда не бросает: не нашлось метода профиля — работает внутренний
-     * набор, не удался и он — рейд всё равно стартует, только с пустыми
-     * карманами и предупреждением в консоли.
+     * Кит Дикого. Одна строка владельца (профиль) и одна строка раскладки
+     * (инвентарь). Без перебора имён методов, без мок-набора, без try/catch
+     * на каждый предмет: в dev-сборке сломанная выдача обязана быть видна.
      */
-    if (faction === 'scav') this._equipScavLoadout(this.rng)
+    if (faction === 'scav') {
+      const descriptor = meta.generateScavLoadout(this.rng)
+      const applied = this.inv.applyLoadout(descriptor)
+      this._scavKitSource = 'meta:generateScavLoadout'
+      this._emitScavKit(descriptor, applied)
+    }
 
     if (this.health && typeof this.health.reset === 'function') this.health.reset()
 
@@ -210,244 +166,24 @@ export class RaidSystem {
     this.lootPoints.length = budget
   }
 
-  /* ====================================================================== */
-  /*                          кит Дикого                                    */
-  /* ====================================================================== */
-
-  /** Первое реально существующее имя выдачи кита в профиле, иначе ''. */
-  _resolveMetaScavMethod(meta) {
-    if (!meta) return ''
-    for (let i = 0; i < META_SCAV_METHODS.length; i++) {
-      const name = META_SCAV_METHODS[i]
-      if (typeof meta[name] === 'function') return name
-    }
-    return ''
+  /** Событие для логов и экрана итогов: что именно выдал профиль. */
+  _emitScavKit(descriptor, applied) {
+    this.ctx.events.emit('raid:scavkit', {
+      source: this._scavKitSource,
+      faction: this.faction,
+      rows: Array.isArray(descriptor) ? descriptor.length : 0,
+      placed: applied && applied.items ? applied.items : 0,
+      dropped: applied && applied.dropped ? applied.dropped : 0
+    })
   }
 
   /**
-   * Единственная точка выдачи снаряжения Дикого.
+   * Мягкий вызов метода профиля в ФИНАЛЬНОЙ части рейда.
    *
-   * Порядок: реальный метод профиля → внутренний мок-набор → предупреждение.
-   * Метод НЕ бросает ни при каком состоянии MetaSystem и инвентаря: он стоит
-   * в середине преварма, и любое исключение отсюда снова заморозило бы экран
-   * высадки.
-   *
-   * @returns {string} 'meta:<method>' | 'internal' | 'none'
-   */
-  _equipScavLoadout(rng) {
-    const meta = this.meta
-    const name = this._resolveMetaScavMethod(meta)
-
-    if (name) {
-      try {
-        meta[name](rng)
-        this._scavKitSource = 'meta:' + name
-        this._emitScavKit()
-        return this._scavKitSource
-      } catch (err) {
-        console.warn('[EFL/raid] meta.' + name + '() упал — выдаём внутренний кит Дикого', err)
-      }
-    } else {
-      console.warn('[EFL/raid] в профиле нет выдачи кита Дикого (' + META_SCAV_METHODS.join(' / ') + ') — работает внутренний набор')
-    }
-
-    let ok = false
-    try {
-      ok = this._mockScavKit(rng)
-    } catch (err) {
-      console.error('[EFL/raid] внутренний кит Дикого не выдан', err)
-      ok = false
-    }
-
-    this._scavKitSource = ok ? 'internal' : 'none'
-    if (!ok) console.warn('[EFL/raid] Дикий уходит в рейд без снаряжения — инвентарь недоступен')
-    this._emitScavKit()
-    return this._scavKitSource
-  }
-
-  _emitScavKit() {
-    const events = this.ctx && this.ctx.events ? this.ctx.events : null
-    if (!events || typeof events.emit !== 'function') return
-    try {
-      events.emit('raid:scavkit', { source: this._scavKitSource, faction: this.faction })
-    } catch (err) {
-      /* шина событий не имеет права ронять высадку */
-    }
-  }
-
-  /**
-   * Внутренний мок-набор Дикого: корпус, ствол, магазины, патроны, четыре
-   * кармана и немного хабара. Считается успешным, если хоть что-то легло:
-   * забитый под потолок инвентарь — не повод отменять рейд.
-   */
-  _mockScavKit(rng) {
-    const inv = this.inv
-    if (!inv || typeof inv.add !== 'function') return false
-
-    let placed = 0
-
-    for (let i = 0; i < SCAV_GEAR.length; i++) {
-      const entry = SCAV_GEAR[i]
-      if (this._kitSlotBusy(entry.slot)) continue
-      const it = this._kitStage(entry.id, 1)
-      if (!it) continue
-      if (this._kitEquip(it, entry.slot)) placed++
-    }
-
-    const gun = SCAV_GUNS[this._kitPick(rng, SCAV_GUNS.length)]
-    if (this._kitWeapon(gun, rng)) placed++
-
-    /* Пистолет — примерно каждому второму Дикому. */
-    if (this._kitPick(rng, 2) === 0 && this._kitWeapon(SCAV_SIDEARM, rng)) placed++
-
-    for (let i = 0; i < SCAV_POCKETS.length; i++) {
-      const entry = SCAV_POCKETS[i]
-      if (this._kitAdd(entry.id, this._kitAmount(rng, entry.count), 'pocket')) placed++
-    }
-
-    for (let i = 0; i < SCAV_BARTER.length; i++) {
-      const entry = SCAV_BARTER[i]
-      if (this._kitPlaceOnBody(entry.id, this._kitAmount(rng, entry.count))) placed++
-    }
-
-    return placed > 0
-  }
-
-  _kitWeapon(entry, rng) {
-    if (!entry) return false
-    if (this._kitSlotBusy(entry.slot)) return false
-    const gun = this._kitStage(entry.id, 1)
-    if (!gun) return false
-    if (!this._kitEquip(gun, entry.slot)) return false
-    const mags = Math.max(0, Math.round(Number(entry.magCount) || 0))
-    if (entry.mag) {
-      for (let i = 0; i < mags; i++) this._kitPlaceOnBody(entry.mag, 1)
-    }
-    if (entry.ammo) this._kitPlaceOnBody(entry.ammo, this._kitAmount(rng, entry.rounds))
-    return true
-  }
-
-  /** Промежуточная посадка предмета в любой доступный грид перед equip(). */
-  _kitStage(id, count) {
-    const staging = ['stash', 'pocket']
-    for (let i = 0; i < staging.length; i++) {
-      const it = this._kitAdd(id, count, staging[i])
-      if (it) return it
-    }
-    const body = this._kitBodyPaths()
-    for (let i = 0; i < body.length; i++) {
-      const it = this._kitAdd(id, count, body[i])
-      if (it) return it
-    }
-    return null
-  }
-
-  /** Кладёт предмет на тело: сначала контейнеры, карманы — в последнюю очередь. */
-  _kitPlaceOnBody(id, count) {
-    if (!id) return false
-    const paths = this._kitBodyPaths()
-    for (let i = 0; i < paths.length; i++) {
-      if (this._kitAdd(id, count, paths[i])) return true
-    }
-    return false
-  }
-
-  /*
-   * bodyPaths() отдаёт ПЕРЕИСПОЛЬЗУЕМЫЙ массив инвентаря и правит его на каждом
-   * вызове, поэтому копия обязательна. Порядок переворачиваем: разгрузка и
-   * рюкзак впереди, 'pocket' в хвосте — иначе патроны съедали бы карманы
-   * раньше, чем до них дойдёт SCAV_POCKETS.
-   */
-  _kitBodyPaths() {
-    const inv = this.inv
-    if (!inv || typeof inv.bodyPaths !== 'function') return ['pocket']
-    let raw = null
-    try {
-      raw = inv.bodyPaths()
-    } catch (err) {
-      return ['pocket']
-    }
-    if (!raw || !raw.length) return ['pocket']
-    const containers = []
-    const rest = []
-    for (let i = 0; i < raw.length; i++) {
-      const path = String(raw[i])
-      if (path.indexOf('in:') === 0) containers.push(path)
-      else rest.push(path)
-    }
-    return containers.concat(rest)
-  }
-
-  _kitAdd(id, count, path) {
-    const inv = this.inv
-    if (!id || !path || !inv || typeof inv.add !== 'function') return null
-    const n = Math.max(1, Math.round(Number(count) || 1))
-    try {
-      return inv.add(id, n, path, { fir: true }) || null
-    } catch (err) {
-      return null
-    }
-  }
-
-  _kitEquip(it, slot) {
-    const inv = this.inv
-    if (!it || !inv || typeof inv.equip !== 'function') return false
-    try {
-      return !!inv.equip(it.uid, slot)
-    } catch (err) {
-      return false
-    }
-  }
-
-  _kitSlotBusy(slot) {
-    const inv = this.inv
-    if (!inv || typeof inv.slotItem !== 'function') return false
-    try {
-      return !!inv.slotItem(slot)
-    } catch (err) {
-      return false
-    }
-  }
-
-  /** Детерминированный индекс из rng рейда, с полным набором фолбэков. */
-  _kitPick(rng, max) {
-    const n = Math.max(1, Math.round(Number(max) || 1))
-    if (n === 1) return 0
-    if (rng && typeof rng.int === 'function') {
-      const v = Math.round(Number(rng.int(0, n - 1)))
-      if (Number.isFinite(v)) return Math.max(0, Math.min(n - 1, v))
-    }
-    if (rng && typeof rng.float === 'function') {
-      const f = Number(rng.float())
-      if (Number.isFinite(f)) return Math.max(0, Math.min(n - 1, Math.floor(f * n)))
-    }
-    return 0
-  }
-
-  _kitAmount(rng, range) {
-    const pair = Array.isArray(range) ? range : [range, range]
-    const lo = Math.round(Number(pair[0]) || 1)
-    const hi = Math.round(Number(pair[1]) || lo)
-    const min = Math.max(1, Math.min(lo, hi))
-    const max = Math.max(min, Math.max(lo, hi))
-    if (max === min) return min
-    if (rng && typeof rng.int === 'function') {
-      const v = Math.round(Number(rng.int(min, max)))
-      if (Number.isFinite(v)) return Math.max(min, Math.min(max, v))
-    }
-    if (rng && typeof rng.float === 'function') {
-      const f = Number(rng.float())
-      if (Number.isFinite(f)) return Math.max(min, Math.min(max, min + Math.floor(f * (max - min + 1))))
-    }
-    return min
-  }
-
-  /**
-   * Мягкий вызов метода профиля.
-   *
-   * Ровно тот же класс аварии, что и equipScavKit: отсутствующий или
-   * бросающий метод MetaSystem не имеет права оставлять рейд в active-состоянии
-   * и не давать эмитнуть raid:end.
+   * Остаётся мягким только здесь и только по одной причине: extract() и end()
+   * ОБЯЗАНЫ дойти до emit('raid:end'). Упавший spend/keepLoadout не имеет
+   * права оставить игрока навечно в рейде без экрана итогов. На выдачу
+   * снаряжения это послабление не распространяется.
    */
   _metaCall(name, ...args) {
     const meta = this.meta
@@ -528,19 +264,7 @@ export class RaidSystem {
   /** Ни рюкзака, ни основного ствола. Тоже не существовал. */
   handsFree() {
     if (!this.inv || typeof this.inv.slotItem !== 'function') return true
-    let backpack = null
-    let primary = null
-    try {
-      backpack = this.inv.slotItem('backpack')
-    } catch (e) {
-      backpack = null
-    }
-    try {
-      primary = this.inv.slotItem('primary')
-    } catch (e) {
-      primary = null
-    }
-    return !backpack && !primary
+    return !this.inv.slotItem('backpack') && !this.inv.slotItem('primary')
   }
 
   /** Условия выхода из EFL: фракция, время, ключ, цена, свободные руки.
