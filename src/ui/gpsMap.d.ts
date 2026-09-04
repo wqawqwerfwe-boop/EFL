@@ -17,7 +17,9 @@ export class GpsMap {
   zoom: number
   followPlayer: boolean
   markers: Marker[]
+  readonly questsLive: boolean
   setMap(id: string): void
+  setObjectives(markers: Marker[] | null): void
   update(dt: number): void
   render(): void
   hasDevice(): boolean
@@ -27,4 +29,5 @@ export class GpsMap {
   addMarker(m: Partial<Marker>): void
   removeMarker(id: string): void
   panBy(dx: number, dz: number): void
+  dispose(): void
 }

@@ -19,10 +19,20 @@ export default function GpsPanel({ ctx: liveCtx }: { ctx?: any }) {
   const worldRef = useRef({ mapId: initialMap })
   const inventoryRef = useRef({ special: [GPS_ITEM, 'item_compass'] })
   const ctxRef = useRef<any>(liveCtx ? {
+    events: liveCtx.events,
     get(name: string) {
       if (name === 'world') return worldRef.current
       if (name === 'inventory') return inventoryRef.current
       return liveCtx.get(name)
+    },
+    peek(name: string) {
+      if (name === 'world') return worldRef.current
+      if (name === 'inventory') return inventoryRef.current
+      return liveCtx.peek?.(name) || null
+    },
+    has(name: string) {
+      if (name === 'world' || name === 'inventory') return true
+      return liveCtx.has?.(name) === true
     },
   } : createCtx())
   const [mapId, setMapId] = useState(initialMap)
@@ -96,6 +106,8 @@ export default function GpsPanel({ ctx: liveCtx }: { ctx?: any }) {
       window.clearInterval(hud)
       window.removeEventListener('keydown', down)
       window.removeEventListener('keyup', up)
+      map.dispose()
+      mapRef.current = null
     }
   }, [])
 

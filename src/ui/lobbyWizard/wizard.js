@@ -95,7 +95,7 @@ export class LobbyWizard {
 			mapId: 'factory',
 			clockSlot: 0,
 			night: false,
-			training: true,
+			training: false,
 			offline: defaultOfflineConfig()
 		}
 
@@ -955,7 +955,11 @@ export class LobbyWizard {
 			afterTerrain: async function () {
 				const raid = self._peek('raid')
 				if (!raid) return null
-				return await call(raid, 'start', map.id, faction, night)
+				return await call(raid, 'start', map.id, faction, night, {
+					isTraining: self.state.training === true,
+					offline: self.state.training === true,
+					insurance: true,
+				})
 			}
 		})
 

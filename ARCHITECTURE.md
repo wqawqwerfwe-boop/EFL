@@ -85,6 +85,9 @@ Emit and listen via `ctx.events`. Payloads are plain objects. The canonical set:
 | ↳ | means *damage dealt **to** `target`*. `target` is the local player when an enemy round connects (`'player'`, the player system, or anything with `isPlayer === true`) — filter it out before drawing a hitmarker. Damage is applied by the target's own listener, never by the emitter as well. | |
 | `damage:taken` | `{ amount, from: Vector3, health }` | player |
 | `actor:death` | `{ actor, point, impulse }` | ai |
+| `ai:redirect` | `{ actor, id, position, normal, dir, reason }` | ai |
+| `raid:end` | `{ kind, summary, training, kitRetained, mapId, faction }` | raid |
+| `menu:open` | `{ tab, summary?, training?, error? }` | raid / main |
 | `player:land` | `{ velocity, surface }` | player |
 | `player:footstep` | `{ position, surface, running }` | player |
 | `player:state` | `{ stance, sprinting, sliding, ads }` | player |

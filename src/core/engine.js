@@ -248,6 +248,9 @@ export class Engine {
       mapId: opts.mapId ?? 'factory',
       faction: opts.faction ?? 'pmc',
       night: !!opts.night,
+      isTraining: opts.isTraining === true || opts.training === true || opts.offline === true,
+      offline: opts.offline === true,
+      insurance: opts.insurance !== false,
     };
     try {
       if (this.mainMenu?.isOpen?.()) {
@@ -257,7 +260,7 @@ export class Engine {
       if (!raid || typeof raid.start !== 'function') {
         throw new Error('[engine] raid subsystem missing');
       }
-      await raid.start(startOpts.mapId, startOpts.faction, startOpts.night);
+      await raid.start(startOpts.mapId, startOpts.faction, startOpts.night, startOpts);
       this.enterGameplay();
       this.requestPointerLock();
     } catch (err) {

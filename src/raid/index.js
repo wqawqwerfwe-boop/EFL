@@ -31,6 +31,43 @@ import { EFL } from '../core/config.js'
  * Файл сознательно без точек с запятой.
  * ========================================================================== */
 
+export const RAID_END = Object.freeze({
+  extracted: 'extracted',
+  killed: 'killed',
+  mia: 'mia',
+  timeout: 'timeout',
+  aborted: 'aborted',
+})
+
+/** Lobby flags the raid controller understands. Unknown keys are preserved. */
+export const DEFAULT_RAID_OPTIONS = Object.freeze({
+  isTraining: false,
+  offline: false,
+  night: false,
+  insurance: true,
+})
+
+/**
+ * Normalise whatever the lobby handed over into a complete options object.
+ * Accepts a boolean (legacy `night` positional), a partial object or nothing.
+ * `isTraining` is coerced strictly — only a real `true` turns protection on.
+ */
+export function normalizeRaidOptions(input, night) {
+  const out = Object.assign({}, DEFAULT_RAID_OPTIONS)
+  if (input && typeof input === 'object') {
+    const keys = Object.keys(input)
+    for (let i = 0; i < keys.length; i++) out[keys[i]] = input[keys[i]]
+  }
+  out.night = night === undefined ? !!out.night : !!night
+  out.isTraining = input && typeof input === 'object' ? input.isTraining === true : false
+  out.offline = out.isTraining || out.offline === true
+  return out
+}
+
+function endKind(kind) {
+  return RAID_END[kind] ? RAID_END[kind] : RAID_END.mia
+}
+
 export class RaidSystem {
   static id = 'raid'
   static deps = ['world', 'inventory', 'items', 'health', 'meta', 'ai', 'ui', 'audio', 'physics']
@@ -42,6 +79,12 @@ export class RaidSystem {
   /* Источник кита Дикого в последней высадке. Теперы всегда либо профиль,
    * либо пустота — внутренних наборов больше нет. */
   _scavKitSource = ''
+
+  raidOptions = Object.assign({}, DEFAULT_RAID_OPTIONS)
+
+  isTraining() {
+    return !!(this.raidOptions && this.raidOptions.isTraining === true)
+  }
 
   async init(ctx) {
     this.ctx = ctx
@@ -74,7 +117,9 @@ export class RaidSystem {
       exit: '',
       mapId: '',
       faction: '',
-      night: false
+      night: false,
+      training: false,
+      kitRetained: false
     }
 
     this._onKill = (e) => {
@@ -90,14 +135,17 @@ export class RaidSystem {
   }
 
   /* ---------- старт ---------- */
-  async start(mapId, faction, night) {
+  async start(mapId, faction, night, options) {
     const seed = this.ctx.rng.u32()
     this.rng = this.ctx.rng.fork('raid:' + seed)
+    this.raidOptions = normalizeRaidOptions(options, night)
     this.mapId = mapId
     this.faction = faction
-    this.night = !!night
+    this.night = this.raidOptions.night
     this.kills = 0
     this._scavKitSource = ''
+    this._activeExit = null
+    this._holdT = 0
     this.summary = {
       kind: '',
       kills: 0,
@@ -107,23 +155,22 @@ export class RaidSystem {
       exit: '',
       mapId,
       faction,
-      night: !!night
+      night: this.night,
+      training: this.isTraining(),
+      kitRetained: false,
     }
 
     const meta = this.ctx.get('meta')
 
-    /*
-     * Таймер Дикого проверяется ДО buildMap(): отказ обязан быть дешёвым.
-     * Исключение ловит engine.startRaid() и возвращает игрока в меню.
-     */
-    if (faction === 'scav') {
+    /* Таймер Дикого проверяется ДО buildMap(): отказ обязан быть дешёвым.
+     * В тренировочном рейде кулдаун не применяется — это оффлайн-сессия. */
+    if (faction === 'scav' && !this.isTraining()) {
       const left = meta.scavCooldownLeft()
       if (left > 0) {
         throw new Error('[EFL/raid] выход за Дикого будет доступен через ' + Math.ceil(left / 1000) + ' с')
       }
     }
 
-    // строим мир по требованию — вот ради чего world.buildMap асинхронный
     const map = await this.world.buildMap(mapId, { night: this.night, seed })
     this.exits = map.exits
     this.timeLeft = map.duration
@@ -131,11 +178,6 @@ export class RaidSystem {
 
     this._scatterLoot(map)
 
-    /*
-     * Кит Дикого. Одна строка владельца (профиль) и одна строка раскладки
-     * (инвентарь). Без перебора имён методов, без мок-набора, без try/catch
-     * на каждый предмет: в dev-сборке сломанная выдача обязана быть видна.
-     */
     if (faction === 'scav') {
       const descriptor = meta.generateScavLoadout(this.rng)
       const applied = this.inv.applyLoadout(descriptor)
@@ -146,7 +188,14 @@ export class RaidSystem {
     if (this.health && typeof this.health.reset === 'function') this.health.reset()
 
     this.active = true
-    this.ctx.events.emit('raid:start', { mapId, faction, night: this.night, seed })
+    this.ctx.events.emit('raid:start', {
+      mapId,
+      faction,
+      night: this.night,
+      seed,
+      training: this.isTraining(),
+      options: this.raidOptions,
+    })
   }
 
   _scatterLoot(map) {
@@ -392,44 +441,196 @@ export class RaidSystem {
   }
 
   extract(exit) {
-    if (exit.cost) this._metaCall('spend', 'rub', exit.cost)
-    this.ctx.events.emit('raid:extract', { exit, transfer: !!exit.transfer })
-    this.end('survived', exit)
+    if (!this.active) return
+    if (exit?.cost) this._metaCall('spend', 'rub', exit.cost)
+    this.summary.exit = exit && typeof exit.id === 'string' ? exit.id : exit?.label || exit?.name || ''
+    this.ctx.events.emit('raid:extract', { exit, transfer: !!exit?.transfer })
+    this.end(RAID_END.extracted)
   }
 
   /* ---------- конец ---------- */
-  end(kind, exit) {
+  end(kind) {
     if (!this.active) return
     this.active = false
 
-    const s = this.summary
-    s.kind = kind
-    s.kills = this.kills
-    s.exit = exit?.name ?? ''
-    s.mapId = this.mapId
-    s.faction = this.faction
-    s.night = this.night
-    s.time = Math.max(0, this.ctx.time.elapsed - this._startElapsed)
-    s.value = 0
-    /* Коэрсим цену и количество: один undefined превращал всю сводку в NaN. */
-    for (const it of this.inv.all) {
-      if (!this.inv.onBody(it)) continue
-      s.value += (Number(this.items.price(it.id)) || 0) * (Number(it.n) || 0)
+    const k = endKind(kind)
+    const training = this.isTraining()
+
+    this.summary.kind = k
+    this.summary.kills = this.kills
+    this.summary.time = Math.max(0, this.ctx.time.elapsed - this._startElapsed)
+    this.summary.training = training
+    this.summary.value = this._kitValue()
+
+    let kitRetained = false
+
+    if (k === RAID_END.extracted) {
+      kitRetained = this._settleExtract()
+    } else if (training) {
+      /* OFFLINE DEATH PROTECTION.
+       * Hard bypass. No death payload is built, nothing is serialised, no wipe
+       * runs, the profile is not told a character died. The body — container,
+       * rig, weapons, pockets, secure — stays exactly as it was at the moment
+       * of death and the player returns to the stash with it. */
+      kitRetained = this._settleTraining(k)
+    } else {
+      kitRetained = this._settleDeath(k)
     }
 
-    if (kind === 'survived') this._metaCall('keepLoadout')
-    else this._metaCall('loseLoadout', kind)       // страховка разбирается внутри meta
+    this.summary.kitRetained = kitRetained
 
-    /* ГЛАВНОЕ: освобождаем всю геометрию и RT. Под try — падение teardown()
-     * раньше съедало и raid:end, а без этого события UI навсегда оставался
-     * в рейде: ни итогов, ни возврата в убежище. */
+    this._clearField()
+    if (this.health && typeof this.health.reset === 'function') this.health.reset()
+
+    this.ctx.events.emit('raid:end', {
+      kind: k,
+      summary: this.summary,
+      training,
+      kitRetained,
+      mapId: this.mapId,
+      faction: this.faction,
+    })
+
+    this._returnToStash(k, training)
+  }
+
+  /* ---------- урегулирование снаряжения ---------- */
+
+  /** Extraction: the profile banks the loadout and the FIR loot. */
+  _settleExtract() {
+    const snapshot = this._serializeBody()
+    this._metaCall('keepLoadout', snapshot, this.summary)
+    this._metaCall('bankRaid', this.summary)
+    if (this.faction === 'scav') this._metaCall('transferScavKit', snapshot, this.summary)
+    return true
+  }
+
+  /**
+   * Training death. Deliberately does NOT call `_serializeBody()`, does NOT
+   * call `applyDeath`, does NOT clear any body path. Only a bookkeeping note
+   * for the result screen; even that is optional for the profile.
+   */
+  _settleTraining(kind) {
+    this._metaCall('noteTrainingRaid', { kind, summary: this.summary })
+    return true
+  }
+
+  /**
+   * Live death / MIA / timeout — the hardcore path. Serialise what was on the
+   * body, hand the death payload to the profile, then wipe the body paths so
+   * the stash shows exactly what the profile decided survived (insurance,
+   * secure container).
+   */
+  _settleDeath(kind) {
+    const snapshot = this._serializeBody()
+    const payload = { kind, summary: this.summary, body: snapshot, insured: !!this.raidOptions.insurance }
+    this._metaCall('applyDeath', payload)
+    this._wipeBody()
+    if (this.faction === 'scav') this._metaCall('startScavCooldown', this.summary)
+    return false
+  }
+
+  /** Snapshot of every body path. Soft: a missing serializer yields null. */
+  _serializeBody() {
+    const inv = this.inv
+    if (!inv) return null
+    if (typeof inv.serializeBody === 'function') return inv.serializeBody()
+    if (typeof inv.serialize === 'function') return inv.serialize({ scope: 'body' })
+    if (!Array.isArray(inv.all) || typeof inv.onBody !== 'function') return null
+    return inv.all.filter((item) => item && inv.onBody(item)).map((item) => ({ ...item }))
+  }
+
+  /** Clear every body path except the secure container. */
+  _wipeBody() {
+    const inv = this.inv
+    if (!inv) return
+    if (typeof inv.wipeBody === 'function') {
+      inv.wipeBody({ keepSecure: true })
+      return
+    }
+    if (typeof inv.bodyPaths === 'function' && typeof inv.clearPath === 'function') {
+      const paths = inv.bodyPaths()
+      for (let i = 0; i < paths.length; i++) {
+        const p = paths[i]
+        if (typeof p === 'string' && p.indexOf('secure') === 0) continue
+        inv.clearPath(p)
+      }
+      return
+    }
+    if (!Array.isArray(inv.all) || typeof inv.remove !== 'function' || typeof inv.onBody !== 'function') return
+    const secure = typeof inv.slotItem === 'function' ? inv.slotItem('secure') : null
+    const keep = new Set()
+    if (secure) {
+      keep.add(secure.uid)
+      const grid = typeof inv.grid === 'function' ? inv.grid('in:' + secure.uid) : null
+      for (const item of grid?.items || []) keep.add(item.uid)
+    }
+    for (let i = inv.all.length - 1; i >= 0; i--) {
+      const item = inv.all[i]
+      if (item && inv.onBody(item) && !keep.has(item.uid)) inv.remove(item.uid)
+    }
+  }
+
+  /** Rouble value of the current body for the result screen. Soft. */
+  _kitValue() {
+    const inv = this.inv
+    if (!inv) return 0
+    try {
+      if (typeof inv.bodyValue === 'function') {
+        const v = inv.bodyValue()
+        return Number.isFinite(v) ? v : 0
+      }
+      if (!Array.isArray(inv.all) || typeof inv.onBody !== 'function') return 0
+      let value = 0
+      for (const item of inv.all) {
+        if (!item || !inv.onBody(item)) continue
+        value += (Number(this.items.price(item.id)) || 0) * (Number(item.n) || 0)
+      }
+      return value
+    } catch (_err) {
+      return 0
+    }
+  }
+
+  /* ---------- уборка поля ---------- */
+
+  /** Corpses and loot points are pooled; only their contents are dropped. */
+  _clearField() {
+    for (let i = 0; i < this.lootPoints.length; i++) {
+      const lp = this.lootPoints[i]
+      lp.items.length = 0
+      lp.opened = false
+      lp.mesh = null
+    }
+    this.lootPoints.length = 0
+    this.corpses.length = 0
+    this.exits = []
+    this._activeExit = null
+    this._holdT = 0
+    this._exitOut.open = false
+    this._exitOut.reason = ''
+    this._exitOut.progress = 0
     try {
       if (this.world && typeof this.world.teardown === 'function') this.world.teardown()
     } catch (err) {
       console.error('[EFL/raid] world.teardown() упал', err)
     }
-    this.corpses.length = 0
-    this.ctx.events.emit('raid:end', { kind, summary: { ...s } })
+  }
+
+  _returnToStash(kind, training) {
+    const ctx = this.ctx
+    const menu = (typeof ctx.peek === 'function' ? ctx.peek('mainMenu') : null) || ctx.engine?.mainMenu || null
+    const tab = kind === RAID_END.extracted || training ? 'stash' : 'result'
+    if (tab === 'stash' && typeof ctx.engine?.returnToMenu === 'function') ctx.engine.returnToMenu()
+    if (menu && typeof menu.show === 'function') {
+      try {
+        menu.show(tab, { summary: this.summary, training })
+        return
+      } catch (err) {
+        console.warn('[EFL/raid] mainMenu.show(' + tab + ') упал, уходим через событие', err)
+      }
+    }
+    ctx.events.emit('menu:open', { tab, summary: this.summary, training })
   }
 
   /**
@@ -452,7 +653,9 @@ export class RaidSystem {
       exit: s.exit || '',
       mapId: s.mapId || '',
       faction: s.faction || '',
-      night: !!s.night
+      night: !!s.night,
+      training: s.training === true,
+      kitRetained: s.kitRetained === true
     }
   }
 

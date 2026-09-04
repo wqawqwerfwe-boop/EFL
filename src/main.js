@@ -7,6 +7,7 @@ import { Engine, STATE } from './core/engine.js';
 import { createConfig } from './core/config.js';
 import { MainMenuSystem } from './ui/mainMenu.js';
 import { applyMainMenuBridge } from './ui/mainMenuBridge.js';
+import { applyLobbyDeployFlags } from './ui/lobbyDeployFlags.js'
 
 import { RenderSystem } from './render/index.js';
 import { MaterialSystem } from './materials/index.js';
@@ -107,6 +108,7 @@ try {
  * получил бы непропатченный mount, и слушатель бы так и не встал. Вызов
  * идемпотентен — повторные заходы (HMR) ничего не ломают. */
 applyMainMenuBridge();
+applyLobbyDeployFlags()
 
 const mainMenu = new MainMenuSystem({
   engine,
