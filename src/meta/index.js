@@ -1,6 +1,7 @@
 import { EFL } from '../core/config.js'
 import { applyInventoryPersistence } from '../inventory/persistence.js'
 import { armorMaterial, ensureArmorInstance, isArmorDef } from '../items/index.js'
+import { rollScavKeycard, rollScavPockets, rollScavWeapon, scavCooldownMs, SCAV_ITEM_IDS } from './loadouts.js'
 
 const SKEY = 'efl_ow_v1'
 
@@ -76,6 +77,18 @@ const FX_FALLBACK = Object.freeze({ usd: 145, eur: 160 })
 /** Контейнеры тела. Восстанавливаются ПЕРВЫМИ: они создают сетки in:<uid>. */
 const CONTAINER_SLOTS = ['secure', 'rig', 'backpack']
 
+/**
+ * Корпус Дикого. Генератор в loadouts.js стерилен и про слоты не знает, а
+ * разгрузка нужна физически: сетка карманов 4x1, и в неё не влезает даже
+ * собственный хлам Дикого, не говоря о запасном магазине.
+ */
+const SCAV_RIG = 'rig_bankrobber'
+/** Ячеек в гриде 'pocket'. Всё, что не поместилось, уезжает в разгрузку. */
+const POCKET_CELLS = 4
+/** Ширина раскладки в разгрузке. Точные координаты — подсказка, не приказ:
+ *  restore() сам вызовет findFree(), если предмет не встал. */
+const RIG_ROW = 4
+
 export class MetaSystem {
 	static id = 'meta'
 	static deps = ['items', 'inventory']
@@ -86,13 +99,16 @@ export class MetaSystem {
 		this.inv = ctx.get('inventory')
 		this.rng = ctx.rng.fork('meta')
 
-		/* clearAll/restore/commitRestore живут в inventory/persistence.js: модель
-		 * предметов не должна знать про формат сейва. Вызов идемпотентен. */
+		/* clearAll/restore/commitRestore/applyLoadout живут в
+		 * inventory/persistence.js: модель предметов не должна знать ни про формат
+		 * сейва, ни про формат выдачи. Вызов идемпотентен. */
 		applyInventoryPersistence()
 
 		this.P = this._fresh()
 		this._saveT = 0
 		this._dirty = false
+		/* Иды кита Дикого сверяются с базой предметов один раз за сессию. */
+		this._scavChecked = false
 		/* Запись сломана (квота, приватный режим, сейв из будущего). Автосейв
 		 * разоружается до явного «ПОВТОРИТЬ»: иначе исключение прилетает в игровой
 		 * кадр каждые 8 секунд. */
@@ -361,6 +377,186 @@ export class MetaSystem {
 		this.P.pendingInsurance = returned              // придёт через N рейдов
 		this.P.insured.length = 0
 		this._dirty = true
+	}
+
+	/* ====================================================================== */
+	/*                            кит Дикого                                  */
+	/* ====================================================================== */
+
+	/**
+	 * Сколько миллисекунд осталось до следующего выхода Диким. 0 — можно идти.
+	 *
+	 * Метка P.scavCd абсолютная и лежит в профиле, то есть переживает и
+	 * перезагрузку страницы, и закрытие вкладки — таймер Дикого нельзя
+	 * обнулить через F5.
+	 */
+	scavCooldownLeft(nowMs) {
+		const arg = Number(nowMs)
+		const now = Number.isFinite(arg) ? arg : Date.now()
+		const until = Number(this.P.scavCd)
+		if (!Number.isFinite(until)) return 0
+		const left = until - now
+		if (left <= 0) return 0
+		/* Метка из будущего: часы перевели назад, сейв приехал с другой машины.
+		 * Ждать больше максимально возможного кулдауна не за что — иначе Дикий
+		 * оказался бы заперт навсегда без единого способа это починить. */
+		const max = scavCooldownMs(-1)
+		if (left > max) {
+			this.P.scavCd = now
+			this._dirty = true
+			return 0
+		}
+		return Math.round(left)
+	}
+
+	/** Пускать ли игрока в рейд за Дикого прямо сейчас. */
+	canDeployScav(nowMs) {
+		return this.scavCooldownLeft(nowMs) === 0
+	}
+
+	/**
+	 * Разовая сверка пулов Дикого с базой предметов.
+	 *
+	 * Техзадание описывало кит именами wpn_ak74u / item_cigarettes, которых в
+	 * ITEMS нет; подмены задокументированы в loadouts.js. Тихо промахнуться
+	 * мимо базы всё же можно — например, вырезав предмет, — и тогда рейд узнает
+	 * об этом одной строкой в консоли, а не пустым карманом без объяснений.
+	 */
+	_checkScavItems() {
+		if (this._scavChecked) return
+		this._scavChecked = true
+		if (!this.items || typeof this.items.get !== 'function') return
+		const missing = []
+		const ids = SCAV_ITEM_IDS.concat([SCAV_RIG])
+		for (let i = 0; i < ids.length; i++) {
+			if (!this.items.get(ids[i])) missing.push(ids[i])
+		}
+		if (missing.length) console.warn('[meta] кит Дикого ссылается на отсутствующие предметы: ' + missing.join(', '))
+	}
+
+	/**
+	 * ВЫДАЧА КИТА ДИКОГО. Единственный владелец снаряжения Дикого в проекте.
+	 *
+	 * Раньше этого метода не существовало вовсе, и RaidSystem перебирал семь
+	 * возможных имён, а не найдя ни одного — собирал кит сам, из статических
+	 * таблиц, не видя ни кармы, ни уровня. Теперь баланс живёт в данных
+	 * (loadouts.js), раскладка — в инвентаре (applyLoadout), а профиль
+	 * связывает их и платит за это таймером.
+	 *
+	 * Формат возврата — кортежи
+	 *   [uid, itemId, count, path, x, y, rotation, durability]
+	 * плюс два необязательных хвостовых поля [nm, am] для стволов и магазинов:
+	 * без них «полупустой магазин» из техзадания не выразим вообще. uid здесь
+	 * локальные, 1..N, и нужны только чтобы связать вложение с контейнером
+	 * через path 'in:<uid>' — живые номера выдаст applyLoadout().
+	 *
+	 * Прочность ствола пишется экземпляру строго внутри границ, выкаченных
+	 * scavDurabilityRange(), и переживает сейв: serialize() кладёт i.dur в
+	 * кортеж (индекс 10), а _restoreInventory() читает его обратно.
+	 *
+	 * @param {object} rng поток рейда; форк от него делается здесь
+	 * @returns {Array<Array>} дескриптор для InventorySystem.applyLoadout()
+	 * @throws {Error} если таймер Дикого ещё не вышел
+	 */
+	generateScavLoadout(rng) {
+		const left = this.scavCooldownLeft()
+		if (left > 0) throw new Error('[meta] Дикий на кулдауне ещё ' + Math.ceil(left / 1000) + ' с')
+
+		this._checkScavItems()
+
+		/* Свой поток: кит не должен сдвигать ни одну последующую выборку рейда,
+		 * иначе один лишний бросок в кармане менял бы весь лут на карте. */
+		const source = rng && typeof rng.fork === 'function' ? rng : this.rng
+		const stream = source.fork('scav:' + (this.P.stats?.raids ?? 0))
+
+		const karma = Math.max(-1, Math.min(1, Number(this.P.karma) || 0))
+		const lvl = Math.max(1, Math.round(Number(this.P.lvl) || 1))
+
+		const rows = []
+		let uid = 1
+		const put = (id, n, path, x, y, dur, nm, am) => {
+			const own = uid++
+			rows.push([
+				own,
+				id,
+				Math.max(1, Math.round(Number(n) || 1)),
+				path,
+				Math.max(0, Math.round(Number(x) || 0)),
+				Math.max(0, Math.round(Number(y) || 0)),
+				0,
+				dur == null ? null : Math.round(Number(dur) * 10) / 10,
+				nm == null ? 0 : Math.max(0, Math.round(Number(nm) || 0)),
+				am == null ? null : am
+			])
+			return own
+		}
+
+		/* Разгрузка идёт первой строкой: applyLoadout() кладёт вещи волнами, и
+		 * сетка 'in:<uid>' появляется только после того, как ляжет сам контейнер. */
+		const rigUid = put(SCAV_RIG, 1, 'slot:rig', 0, 0, null)
+		const rigPath = 'in:' + rigUid
+		let rigCell = 0
+		const intoRig = (id, n, dur, nm, am) => {
+			const cell = rigCell++
+			return put(id, n, rigPath, cell % RIG_ROW, Math.floor(cell / RIG_ROW), dur, nm, am)
+		}
+
+		/* Ствол. Роль решает пул, а не этот файл: ПМ уходит в кобуру, остальное
+		 * на ремень. */
+		const gun = rollScavWeapon(stream, karma, lvl)
+		const gunSlot = gun.role === 'sidearm' ? 'slot:holster' : 'slot:primary'
+		const internal = gun.ammo ? Math.max(0, Number(gun.ammo.internal) || 0) : 0
+		const loadedRaw = gun.mag ? gun.mag.loaded : Math.min(internal, gun.ammo ? gun.ammo.count : 0)
+		const loaded = Math.max(0, Math.round(Number(loadedRaw) || 0))
+		const gunAmmo = gun.mag ? gun.mag.ammo : (gun.ammo ? gun.ammo.id : null)
+		/* dur экземпляра — ровно из брошенного диапазона, потолок остаётся
+		 * заводским: Дикий несёт убитую вещь, а не вещь с другим ресурсом. */
+		put(gun.id, 1, gunSlot, 0, 0, gun.durability, loaded, gunAmmo)
+
+		if (gun.spareMag) intoRig(gun.spareMag.id, 1, null, gun.spareMag.loaded, gun.spareMag.ammo)
+		if (gun.ammo) {
+			const loose = Math.max(0, (Number(gun.ammo.count) || 0) - loaded)
+			if (loose > 0) intoRig(gun.ammo.id, loose, null, 0, null)
+		}
+
+		/* Карманы. Ключ доступа кладётся первым: он и самый ценный, и 1x1. */
+		const pockets = rollScavPockets(stream, karma, lvl)
+		const keycard = rollScavKeycard(stream, karma)
+		if (keycard) pockets.unshift(keycard)
+
+		let cell = 0
+		for (let i = 0; i < pockets.length; i++) {
+			const row = pockets[i]
+			if (cell < POCKET_CELLS) put(row.id, row.count, 'pocket', cell++, 0, null)
+			else intoRig(row.id, row.count, null)
+		}
+
+		/* Таймер. Ставится на КАЖДУЮ выдачу, до всякой высадки: если рейд упадёт
+		 * после этой точки, перекатывать кит до посинения всё равно нельзя. */
+		const now = Date.now()
+		const cooldown = scavCooldownMs(karma)
+		this.P.scavCd = now + cooldown
+		this._dirty = true
+		try {
+			this.save()
+		} catch (e) {
+			/* Плашка уже поднята внутри save(). Высадку это не отменяет: кит выдан,
+			 * профиль в памяти корректен, потерян только диск. */
+			console.error('[meta] таймер Дикого не записан на диск', e)
+		}
+
+		this.ctx?.events?.emit('meta:scavkit', {
+			rows: rows.length,
+			karma,
+			lvl,
+			weapon: gun.id,
+			durability: gun.durability,
+			durabilityRange: gun.durabilityRange,
+			keycard: keycard ? keycard.id : null,
+			cooldownMs: cooldown
+		})
+		console.info('[meta] кит Дикого: ' + gun.id + ' ' + gun.durability + '/' + gun.durabilityRange[1] + ', предметов ' + rows.length + ', таймер ' + Math.round(cooldown / 60000) + ' мин')
+		return rows
 	}
 
 	/* ---------- квесты ---------- */
