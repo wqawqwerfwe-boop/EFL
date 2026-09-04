@@ -47,8 +47,9 @@
  *     The fix is three independent gates, because one of them can always be
  *     unavailable:
  *
- *       1. `_tryVault()` probes forward at ground + `VAULT.STEP_CEILING` and
- *          NEVER higher, checks clearance at ground + `VAULT.CLEARANCE`, and
+ *       1. `_tryVault()` probes forward at ground + `VAULT.LOW_PROBE` (0.30 m,
+ *          strictly below the ceiling) and NEVER higher, checks clearance at
+ *          ground + `VAULT.CLEARANCE`, and
  *          treats low-blocked + high-blocked as a wall: no vertical write, the
  *          horizontal step is rolled back, `desiredSpeed` is forced to 0 and a
  *          lateral redirection path is requested.
@@ -114,8 +115,10 @@ export const DEG = Math.PI / 180
  * volume the body would have to occupy.
  */
 export const VAULT = Object.freeze({
-  /** metres above the actor's own ground level - the ceiling, and the low probe */
+  /** metres above the actor's own ground level - the ceiling */
   STEP_CEILING: 0.45,
+  /** where the forward probe is cast - strictly below the ceiling (0.30 m) */
+  LOW_PROBE: 0.3,
   /** metres above ground for the high clearance probe */
   CLEARANCE: 1.2,
   /** how far ahead both probes reach */
@@ -946,13 +949,18 @@ export class Agent {
     this._preStep.copy(this.root.position)
 
     const step = this.speed * dt
-    this.root.position.addScaledVector(_v, step)
+
+    // GATE 1 - probe the volume the body is about to occupy BEFORE the
+    // horizontal step is committed, so a wall refuses the step while the
+    // actor is still on the pre-step pose instead of after being shoved
+    // into the footprint.
     this._tryVault(_v)
     if (this.blockedByWall) {
       this._sanitize()
       return
     }
 
+    this.root.position.addScaledVector(_v, step)
     this._resolveGround(_v)
     if (this.blockedByWall) {
       this._sanitize()
@@ -1058,7 +1066,7 @@ export class Agent {
       const pz = this._preStep.z
 
       // ---- low probe: strictly at the step ceiling, never above it ----------
-      _low.set(px, groundY + VAULT.STEP_CEILING, pz)
+      _low.set(px, groundY + VAULT.LOW_PROBE, pz)
       _aim.copy(_low).addScaledVector(_v2, VAULT.PROBE)
       if (this._lineOfSight(_low, _aim)) return false
 
@@ -1127,7 +1135,7 @@ export class Agent {
     this.desiredSpeed = 0
     this.speed = 0
     this.velocity.set(0, 0, 0)
-    this._redirect(dir)
+    this._requestRedirect(dir)
 
     const bus = this._bus()
     if (bus && typeof bus.emit === 'function') {
@@ -1184,6 +1192,25 @@ export class Agent {
     this._detourSide = -this._detourSide
     this._goTo(_ahead)
     return true
+  }
+
+  /**
+   * Redirect request: go around the blocking wall and publish the lateral
+   * `ai:redirect` event so any listening host (camera, UI, debug overlay) can
+   * follow the actor around the corner instead of into it.
+   */
+  _requestRedirect(dir) {
+    const ok = this._redirect(dir)
+    const bus = this._bus()
+    if (bus && typeof bus.emit === 'function') {
+      bus.emit('ai:redirect', {
+        actor: this,
+        faction: this.faction,
+        position: this.root.position,
+        blockedHeading: dir ? { x: dir.x, y: 0, z: dir.z } : null,
+      })
+    }
+    return ok
   }
 
   /**

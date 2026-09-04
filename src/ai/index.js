@@ -2,6 +2,21 @@ import * as THREE from 'three';
 import { EFL } from '../core/config.js';
 import { KITS_BY_FACTION, VARIANTS, buildSoldier, resolveMaterials } from './soldier.js';
 import { SoldierMaterials } from './textures.js';
+import { buildActor as compileFactionMesh, disposeActor as freeFactionMesh } from './parts.js';
+
+/**
+ * Re-export the procedural faction mesh compiler so any caller (map spawner,
+ * preview, inspection tooling) can route an actor's body/clothing build through
+ * `buildActor()`. It reads the canonical faction archetype and never emits the
+ * same kit twice: scav civil layers (+PACA only when a plate rolled), raider
+ * combat uniform + helmet/visor/knee pads, pmc camo + ballistic helmet + pack,
+ * and boss signatures (Killa Maska three-stripe visor, Shturman open camo coat).
+ */
+export { buildActor, disposeActor } from './parts.js';
+
+/** The live compiler entry point, alias of the reference `buildActor`. */
+export const buildFactionMesh = compileFactionMesh;
+export const disposeFactionMesh = freeFactionMesh;
 
 export const FACTION = { SCAV: 0, RAIDER: 1, PMC: 2, BOSS: 3 };
 

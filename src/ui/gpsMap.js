@@ -71,6 +71,155 @@ export const MARKER = Object.freeze({
   future: Object.freeze({ fill: '#ffc531', ink: '#1d1403', ring: 'rgba(255,197,49,.26)' }),
 })
 
+/* ------------------------------------------------------------------ *
+ * Reference tactical-chart contract.
+ *
+ * The production `GpsMap` below renders maps from its own authored schema;
+ * these are the reference `MAP_SCHEMAS` layout vectors (metres, x east, z
+ * north) for Factory / Customs / Woods / Interchange plus the reference
+ * marker palette, exposed so any viewer that wants the canonical coordinate
+ * tables can consume them directly.
+ * ------------------------------------------------------------------ */
+
+export const GPS_ITEM = GPS_ITEM_ID
+
+export const MARKER_COLORS = Object.freeze({
+  extract: '#37e07a',
+  active: '#f4d03f',
+  future: '#ef4444',
+  done: '#6b7280',
+})
+
+/* ================================================================== */
+/* Map schemas - metres, x east, z north                              */
+/* ================================================================== */
+
+export const MAP_SCHEMAS = Object.freeze({
+  factory: {
+    name: 'FACTORY',
+    ru: 'ЗАВОД',
+    bounds: [[-60, -60], [60, -60], [60, 60], [-60, 60]],
+    structures: [
+      { label: 'Main hall', poly: [[-40, -20], [20, -20], [20, 30], [-40, 30]] },
+      { label: 'Offices', poly: [[22, -10], [50, -10], [50, 26], [22, 26]], floors: 3 },
+      { label: 'Forklifts', poly: [[-52, -50], [-10, -50], [-10, -24], [-52, -24]] },
+      { label: 'Breach', poly: [[-10, -50], [30, -50], [30, -30], [-10, -30]] },
+      { label: 'Pumping', poly: [[-52, 34], [-18, 34], [-18, 52], [-52, 52]] },
+      { label: 'Tunnels', poly: [[-14, 34], [40, 34], [40, 44], [-14, 44]], under: true },
+    ],
+    roads: [
+      [[-60, -22], [60, -22]],
+      [[-60, 32], [60, 32]],
+      [[0, -60], [0, 60]],
+    ],
+    extractions: [
+      { id: 'factory:gate3', label: 'Gate 3', x: 55, z: -40, radius: 5 },
+      { id: 'factory:gate0', label: 'Gate 0', x: -55, z: 0, radius: 4 },
+      { id: 'factory:cellars', label: 'Cellars', x: -30, z: 55, radius: 4 },
+    ],
+    quests: [
+      { id: 'q:prapor_parcel', label: 'Посылка Прапора', x: -20, z: 5, status: 'active' },
+      { id: 'q:office_docs', label: 'Документы в Офисе', x: 36, z: 8, status: 'future' },
+      { id: 'q:tagilla', label: 'Тагилла (босс)', x: -5, z: -38, status: 'future' },
+    ],
+  },
+  customs: {
+    name: 'CUSTOMS',
+    ru: 'ТАМОЖНЯ',
+    bounds: [[-200, -110], [200, -110], [200, 110], [-200, 110]],
+    structures: [
+      { label: 'Dorms', poly: [[-170, 40], [-120, 40], [-120, 90], [-170, 90]], floors: 3 },
+      { label: 'Gas station', poly: [[-60, 60], [-20, 60], [-20, 85], [-60, 85]] },
+      { label: 'Customs bldg', poly: [[-10, -30], [40, -30], [40, 10], [-10, 10]], floors: 2 },
+      { label: 'Big red', poly: [[-120, -80], [-60, -80], [-60, -40], [-120, -40]] },
+      { label: 'Warehouse 4', poly: [[70, -20], [120, -20], [120, 20], [70, 20]] },
+      { label: 'Construction', poly: [[-50, -100], [10, -100], [10, -60], [-50, -60]] },
+      { label: 'New gas', poly: [[130, 40], [170, 40], [170, 70], [130, 70]] },
+    ],
+    roads: [
+      [[-200, 30], [-130, 30], [-70, 20], [0, 25], [90, 30], [200, 30]],
+      [[-200, -60], [-130, -60], [-40, -50], [60, -60], [200, -60]],
+      [[-40, -110], [-40, 110]],
+      [[90, -110], [90, 110]],
+    ],
+    water: [[[-200, 95], [-130, 100], [-60, 96], [0, 104], [80, 98], [200, 102], [200, 110], [-200, 110]]],
+    extractions: [
+      { id: 'customs:zb1011', label: 'ZB-1011', x: 175, z: -95, radius: 6 },
+      { id: 'customs:crossroads', label: 'Crossroads', x: -190, z: -30, radius: 8 },
+      { id: 'customs:rusroadblock', label: 'RUAF Roadblock', x: 190, z: 10, radius: 6 },
+      { id: 'customs:trailerpark', label: 'Trailer Park', x: -190, z: 95, radius: 6 },
+    ],
+    quests: [
+      { id: 'q:prapor_parcel', label: 'Посылка Прапора', x: -145, z: 65, status: 'active' },
+      { id: 'q:office_docs', label: 'Документы в Офисе', x: 15, z: -10, status: 'future' },
+      { id: 'q:reshala', label: 'Решала (босс)', x: -40, z: 72, status: 'future' },
+    ],
+  },
+  woods: {
+    name: 'WOODS',
+    ru: 'ЛЕС',
+    bounds: [[-250, -200], [250, -200], [250, 200], [-250, 200]],
+    structures: [
+      { label: 'Sawmill', poly: [[-40, -30], [40, -30], [40, 30], [-40, 30]] },
+      { label: 'Lumber camp', poly: [[110, 80], [170, 80], [170, 130], [110, 130]] },
+      { label: 'Scav house', poly: [[-180, 100], [-150, 100], [-150, 125], [-180, 125]] },
+      { label: 'USEC camp', poly: [[-200, -120], [-150, -120], [-150, -80], [-200, -80]] },
+      { label: 'Checkpoint', poly: [[190, -150], [230, -150], [230, -120], [190, -120]] },
+      { label: 'Old station', poly: [[60, -160], [130, -160], [130, -120], [60, -120]] },
+      { label: 'Plane crash', poly: [[-90, 40], [-40, 60], [-60, 80]] },
+    ],
+    roads: [
+      [[-250, -60], [-160, -40], [-60, -20], [0, -34], [90, -60], [250, -100]],
+      [[-40, 30], [-20, 90], [30, 140], [110, 160], [250, 150]],
+    ],
+    water: [[[100, 0], [160, -10], [200, 30], [170, 60], [110, 50]]],
+    extractions: [
+      { id: 'woods:outskirts', label: 'Outskirts', x: -235, z: 40, radius: 8 },
+      { id: 'woods:unroadblock', label: 'UN Roadblock', x: 235, z: -160, radius: 8 },
+      { id: 'woods:rukzb014', label: 'RUAF Gate', x: 40, z: 190, radius: 6 },
+    ],
+    quests: [
+      { id: 'q:shturman_stash', label: 'Тайник Штурмана', x: 0, z: 48, status: 'active' },
+      { id: 'q:prapor_parcel', label: 'Посылка Прапора', x: -160, z: -100, status: 'future' },
+      { id: 'q:jaeger_cabin', label: 'Домик Егеря', x: -100, z: 150, status: 'future' },
+    ],
+  },
+  interchange: {
+    name: 'INTERCHANGE',
+    ru: 'РАЗВЯЗКА',
+    bounds: [[-160, -150], [160, -150], [160, 150], [-160, 150]],
+    structures: [
+      { label: 'ULTRA mall', poly: [[-100, -60], [100, -60], [100, 60], [-100, 60]], floors: 2 },
+      { label: 'IDEA', poly: [[-95, -55], [-30, -55], [-30, 55], [-95, 55]], inner: true },
+      { label: 'Goshan', poly: [[-25, -55], [25, -55], [25, 55], [-25, 55]], inner: true },
+      { label: 'OLI', poly: [[30, -55], [95, -55], [95, 55], [30, 55]], inner: true },
+      { label: 'Power station', poly: [[110, -140], [150, -140], [150, -100], [110, -100]] },
+      { label: 'Kiba', poly: [[-15, 20], [15, 20], [15, 40], [-15, 40]], inner: true },
+      { label: 'Parking', poly: [[-100, 70], [100, 70], [100, 110], [-100, 110]] },
+    ],
+    roads: [
+      [[-160, -80], [-110, -80], [-110, 130], [110, 130], [110, -80], [160, -80]],
+      [[-160, 120], [160, 120]],
+    ],
+    extractions: [
+      { id: 'interchange:emercom', label: 'Emercom', x: 140, z: 100, radius: 8 },
+      { id: 'interchange:railway', label: 'Railway', x: -145, z: -130, radius: 8 },
+      { id: 'interchange:hole', label: 'Hole in fence', x: 150, z: -30, radius: 4 },
+    ],
+    quests: [
+      { id: 'q:kiba_keys', label: 'Ключи от Кибы', x: 0, z: 30, status: 'active' },
+      { id: 'q:office_docs', label: 'Документы в Офисе', x: 60, z: -40, status: 'future' },
+      { id: 'q:killa', label: 'Килла (босс)', x: -60, z: 0, status: 'future' },
+    ],
+  },
+})
+
+export const MAP_IDS = Object.freeze(Object.keys(MAP_SCHEMAS))
+
+/* ================================================================== */
+/* Device                                                             */
+/* ================================================================== */
+
 const PANEL_BG = '#141a17'
 const CHART_BG = '#1b241f'
 const BLOCK_LO = [44, 56, 50]
@@ -791,6 +940,9 @@ export class GpsMap {
         if (it && it.id === GPS_ITEM_ID) return true
       }
     }
+    // Reference convention: an inventory that exposes a `special` array of
+    // item ids directly (rather than a slots map) still gates the device.
+    if (Array.isArray(inv.special) && inv.special.indexOf(GPS_ITEM) !== -1) return true
     if (inv.slots && typeof inv.slots.forEach === 'function' && typeof inv.get === 'function') {
       let found = false
       inv.slots.forEach((uid) => {
