@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none" shape-rendering="geometricPrecision" role="img" aria-label="Escape From Larpov favicon">
+  <defs>
+    <linearGradient id="bg" x1="4" y1="3" x2="28" y2="30" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#293226"/>
+      <stop offset="1" stop-color="#090C0A"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="10" y1="7" x2="22" y2="27" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#566247"/>
+      <stop offset="1" stop-color="#283125"/>
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="30" height="30" rx="6" fill="url(#bg)"/>
+  <rect x="2" y="2" width="28" height="28" rx="5" stroke="#3E4938" stroke-width="2"/>
+  <path d="M16 4.8 24.8 8.2V15c0 6.1-3.7 10.3-8.8 12.6C10.9 25.3 7.2 21.1 7.2 15V8.2L16 4.8Z" fill="url(#shield)" stroke="#B9C39E" stroke-width="2.4" stroke-linejoin="round"/>
+  <path d="M13.2 19.1 7.7 24.6" stroke="#10140F" stroke-width="6" stroke-linecap="round"/>
+  <path d="M13.2 19.1 7.7 24.6" stroke="#A96D35" stroke-width="3.2" stroke-linecap="round"/>
+  <circle cx="7.3" cy="25" r="2.1" fill="#FF7300" stroke="#10140F" stroke-width="2.2"/>
+  <path d="M11.5 17.5 22.8 6.2Q24.8 4.7 26.4 6.3Q28 7.9 26.3 9.4L15 20.7 11.5 17.5Z" fill="#FF6A00" stroke="#10140F" stroke-width="2.6" stroke-linejoin="round"/>
+  <path d="M14.4 17.3 23.9 7.8" stroke="#FFD23D" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M16.3 12.5 20.1 16.3" stroke="#10140F" stroke-width="4.4" stroke-linecap="round"/>
+  <path d="M16.3 12.5 20.1 16.3" stroke="#31E4E8" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M9.3 15.3 17.1 23.1" stroke="#10140F" stroke-width="6.4" stroke-linecap="round"/>
+  <path d="M9.3 15.3 17.1 23.1" stroke="#31E4E8" stroke-width="3.4" stroke-linecap="round"/>
+</svg>
