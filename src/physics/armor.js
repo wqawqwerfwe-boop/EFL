@@ -5,7 +5,8 @@ import {
   ensureArmorInstance,
   isArmorDef,
 } from '../items/index.js'
-import { coversZone } from '../core/anatomy.js'
+import { ZONE_BY_HEALTH_PART, coversZone } from '../core/anatomy.js'
+import { ARCHETYPES, FACTION_BY_INDEX } from '../ai/archetypes.js'
 
 /*
  * ARMOUR — вероятностное пробитие и износ плит.
@@ -117,6 +118,98 @@ export function synthPlate(armorClass, zones, headZones) {
   return { item: { uid: -1, id, dur: durMax, durMax, synthetic: true }, def }
 }
 
+/* ------------------------------------------------------------------ *
+ * Раскладка плит по фракции.
+ *
+ * src/ai/archetypes.js — единственный источник цифр бота, и это замороженный
+ * лист данных без единого импорта, так что читать его отсюда безопасно:
+ * циклов не будет. Берём оттуда armor.parts и armor.helmetDrop, чтобы
+ * синтетическая плита совпадала с тем, что Anatomy.setArmor уже выдала тому же
+ * актору, а не угадывала грудь с животом для всех подряд.
+ *
+ *   scav    class 0..2, только грудь          helmetDrop 2
+ *   raider  class 4..6, голова/грудь/живот    helmetDrop 1
+ *   pmc     class 3..5, голова/грудь/живот    helmetDrop 1
+ *   boss    class 5..6, голова/грудь/живот    helmetDrop 1
+ * ------------------------------------------------------------------ */
+
+const DEFAULT_BODY_ZONES = Object.freeze(['thorax', 'stomach'])
+const DEFAULT_HEAD_SUB_ZONES = Object.freeze(['top', 'nape', 'ears'])
+const DEFAULT_HELMET_DROP = 2
+
+/* Фракция приходит строкой ('raider'), целым из FACTION в src/ai/index.js, или
+ * записью архетипа на самом акторе. Принимаем все три. */
+function factionIdOf(actor) {
+  const f = actor.faction
+  if (typeof f === 'string' && f !== '') return f.toLowerCase()
+  if (typeof f === 'number' && Number.isFinite(f)) {
+    const id = FACTION_BY_INDEX[Math.trunc(f)]
+    if (id !== undefined) return id
+  }
+  const a = actor.archetype
+  if (typeof a === 'string' && a !== '') return a.toLowerCase()
+  if (a && typeof a === 'object' && typeof a.id === 'string') return a.id.toLowerCase()
+  return null
+}
+
+function archetypeOf(actor) {
+  const rec = actor.archetype
+  if (rec && typeof rec === 'object' && rec.armor) return rec
+  const id = factionIdOf(actor)
+  if (id === null) return null
+  const a = ARCHETYPES[id]
+  return a === undefined ? null : a
+}
+
+/* Списки прикрытия пишут в двух словарях: 'rarm' (health) и 'arm_right' (зона). */
+function zoneIdOf(name) {
+  if (typeof name !== 'string' || name === '') return null
+  const mapped = ZONE_BY_HEALTH_PART[name]
+  return mapped === undefined ? name : mapped
+}
+
+/* Что вообще прикрыто у этого актора: явный список на акторе важнее архетипа. */
+function coveredZones(actor, arch) {
+  if (Array.isArray(actor.armorParts) && actor.armorParts.length > 0) return actor.armorParts
+  if (arch && arch.armor && Array.isArray(arch.armor.parts) && arch.armor.parts.length > 0) return arch.armor.parts
+  return DEFAULT_BODY_ZONES
+}
+
+/* Зоны корпуса: голова уезжает на отдельную плиту со своим классом. */
+function bodyZones(actor, arch) {
+  const raw = coveredZones(actor, arch)
+  const out = []
+  for (let i = 0; i < raw.length; i++) {
+    const z = zoneIdOf(raw[i])
+    if (z === null || z === 'head') continue
+    if (out.indexOf(z) < 0) out.push(z)
+  }
+  return out
+}
+
+function coversHead(actor, arch) {
+  const raw = coveredZones(actor, arch)
+  for (let i = 0; i < raw.length; i++) {
+    if (zoneIdOf(raw[i]) === 'head') return true
+  }
+  return false
+}
+
+/*
+ * Каска никогда не держит полный класс жилета — ровно та же просадка, что
+ * делает Anatomy.setArmor, иначе резолвер и модель урона разойдутся на голове.
+ */
+function helmetDropOf(actor, arch) {
+  if (typeof actor.helmetDrop === 'number' && actor.helmetDrop >= 0) return actor.helmetDrop
+  if (arch && arch.armor && typeof arch.armor.helmetDrop === 'number') return arch.armor.helmetDrop
+  return DEFAULT_HELMET_DROP
+}
+
+function headSubZonesOf(actor) {
+  if (Array.isArray(actor.headZones) && actor.headZones.length > 0) return actor.headZones
+  return DEFAULT_HEAD_SUB_ZONES
+}
+
 /*
  * Кто именно прикрывает зону.
  *
@@ -191,18 +284,44 @@ export class ArmorResolver {
     return this._out
   }
 
+  /*
+   * Синтетика бота.
+   *
+   * Кэш строится один раз на актора и живёт на actor._armorZones. Записи
+   * возвращаются как есть, поэтому penetration.js пишет новый ресурс прямо в
+   * rec.item.dur — та же ссылка лежит в кэше, и следующая пуля видит уже
+   * просевшую плиту. Ровно так же, как изнашивается надетая плита игрока.
+   *
+   * Одна запись на весь жилет: грудь и живот делят ОДИН экземпляр, потому что
+   * это один предмет. Иначе жилет держал бы вдвое дольше, просто прикрывая две
+   * зоны.
+   */
   _synthetic(actor, zoneId, subZone) {
     let map = actor._armorZones
     if (!map) {
       map = Object.create(null)
+      const arch = archetypeOf(actor)
+
       const body = typeof actor.armorClass === 'number' ? actor.armorClass : typeof actor.armor === 'number' ? actor.armor : 0
       if (body > 0) {
-        const plate = synthPlate(body, ['thorax', 'stomach'])
-        map.thorax = plate
-        map.stomach = plate
+        const zones = bodyZones(actor, arch)
+        if (zones.length > 0) {
+          const plate = synthPlate(body, zones)
+          for (let i = 0; i < zones.length; i++) map[zones[i]] = plate
+        }
       }
-      const head = typeof actor.helmetClass === 'number' ? actor.helmetClass : 0
-      if (head > 0) map.head = synthPlate(head, ['head'], ['top', 'nape', 'ears'])
+
+      /*
+       * Голова: явный helmetClass важнее всего, иначе выводим её из класса
+       * корпуса через helmetDrop фракции — но только если фракция вообще носит
+       * шлем. Скав с одной грудной пластиной остаётся с голой головой.
+       */
+      let head = typeof actor.helmetClass === 'number' ? actor.helmetClass : 0
+      if (!(head > 0) && body > 0 && coversHead(actor, arch)) {
+        head = body - helmetDropOf(actor, arch)
+      }
+      if (head > 0) map.head = synthPlate(head, ['head'], headSubZonesOf(actor))
+
       actor._armorZones = map
     }
     const rec = map[zoneId]
@@ -216,6 +335,11 @@ export class ArmorResolver {
 
   /**
    * Плита, прикрывающая зону, или null.
+   *
+   * Обе ветки — надетое на игроке и синтетика бота — валидируют зону через
+   * одну и ту же coversZone(def, zoneId, subZone) из core/anatomy.js, так что
+   * подзоны шлема работают одинаково для игрока и для бота.
+   *
    * @returns {{ item: object, def: object } | null} пуловая запись
    */
   resolve(actor, zoneId, subZone) {
