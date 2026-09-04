@@ -3,6 +3,7 @@ import { Registry, EventBus } from './registry.js';
 import { FIXED_DT, MAX_SUBSTEPS } from './config.js';
 import { Input } from './input.js';
 import { Rng } from './rng.js';
+import { disposeScratchTarget } from '../render/scratchTarget.js';
 
 export const STATE = Object.freeze({
   BOOT: 'boot',
@@ -292,6 +293,12 @@ export class Engine {
     this.stop();
     removeEventListener('resize', this._onResize);
     this.input.detach();
+    /* The 1x1 shader-compile target is a session-long singleton owned by the
+     * render system (see render/scratchTarget.js) precisely so the raid prewarm
+     * stops allocating and destroying one per deploy. Engine shutdown is the
+     * only place allowed to free it, and it has to happen before the render
+     * system tears down the WebGL context underneath it. */
+    disposeScratchTarget(this.registry.peek('render'));
     for (const sys of [...this.registry.ordered].reverse()) sys.dispose?.();
     this.events.clear();
   }
