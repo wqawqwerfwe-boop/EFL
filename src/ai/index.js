@@ -1,7 +1,12 @@
 import * as THREE from 'three';
 import { EFL } from '../core/config.js';
+import { KITS_BY_FACTION, VARIANTS, buildSoldier, resolveMaterials } from './soldier.js';
+import { SoldierMaterials } from './textures.js';
 
 export const FACTION = { SCAV: 0, RAIDER: 1, PMC: 2, BOSS: 3 };
+
+/** Faction index -> canonical archetype id, the field the mesh compiler reads. */
+export const FACTION_ID = ['scav', 'raider', 'pmc', 'boss'];
 
 const DEF = [
   { id: 'scav',   hp: 240, acc: 0.42, react: 0.62, view: 62,  fov: 105, wep: ['pm','m870','aks74u','mosin'],  xp: 120, karma: -0.03 },
@@ -24,6 +29,17 @@ const STRAFE_MAX_T = 1.30;
 /* Верхняя граница uint32. Держим константой: она нужна и в детерминированном
  * пути, и в аварийном фолбэке на Math.random. */
 const UINT32_MAX = 4294967295;
+
+/**
+ * Camo patterns baked at boot.
+ *
+ * MUST include every pattern any variant can ask for. `SoldierMaterials` only
+ * bakes `opts.camo ?? ['arid','woodland']` and `get()` THROWS on a set it never
+ * baked, so leaving this at the default takes the raid down the first time a
+ * kit whose pattern is `urban` is compiled — the pre-existing `breacher`
+ * variant and the new `raider` are both urban.
+ */
+const CAMO_BAKES = Object.freeze(['arid', 'woodland', 'urban']);
 
 /* Бюджеты по умолчанию, если EFL.budgets не заполнен целиком. */
 const BUDGET_FALLBACK = { bots: 12, botsUpdatedPerFrame: 4, pathRequestsPerFrame: 2 };
@@ -57,6 +73,12 @@ export class AiSystem {
     this._botBodyGeo = new THREE.CylinderGeometry(0.34, 0.39, 1.52, 8, 1);
     this._botHeadGeo = new THREE.SphereGeometry(0.21, 8, 6);
     this._botMat = new THREE.MeshStandardMaterial({ color: 0x6c7862, roughness: 0.96, metalness: 0.02 });
+
+    // Кэш скомпилированных вариантов модели и общий набор материалов.
+    // Геометрия одна на вариант: скелет — на экземпляр. See variant().
+    this._variantCache = new Map();
+    this._soldierMats = null;
+    this._prewarmed = false;
 
     // преаллокация
     this._v = new THREE.Vector3();
@@ -163,6 +185,39 @@ export class AiSystem {
     return Number.isFinite(gy) ? gy : NaN;
   }
 
+  /**
+   * PUBLIC ground probe. `Agent`'s rewired vault path calls `ai.groundAt(x, z)`
+   * by this name; only the private `_groundAt` existed, so every probe in the
+   * fixed movement path would have thrown `ai.groundAt is not a function` and
+   * taken the frame with it.
+   *
+   * `fromY` is optional here on purpose: the caller usually does not know a
+   * sensible cast origin, and starting well above the query point is what makes
+   * a downward ground query behave.
+   */
+  groundAt(x, z, fromY) {
+    const from = Number.isFinite(fromY) ? fromY : 40;
+    return this._groundAt(x, z, from);
+  }
+
+  /**
+   * Snap a position onto the ground in place.
+   *
+   * Returns false and leaves the vector untouched when there is no ground under
+   * it, which is the answer the vault gate needs: no ground means the step is
+   * into a void and must not be taken. It deliberately does NOT clamp or
+   * reinterpret the height — the whole point of the vault rewrite is that
+   * vertical position is only ever set from a probe that succeeded.
+   */
+  probeGround(pos, fromY) {
+    if (!pos) return false;
+    const from = Number.isFinite(fromY) ? fromY : pos.y + 4;
+    const gy = this._groundAt(pos.x, pos.z, from);
+    if (!Number.isFinite(gy)) return false;
+    pos.y = gy;
+    return true;
+  }
+
   _sees(from, to) {
     const p = this.physics;
     if (!p || typeof p.lineOfSight !== 'function') return true;
@@ -201,6 +256,182 @@ export class AiSystem {
     return this._fallbackImpact;
   }
 
+  /* ---------- модель актора: материалы и варианты ---------- */
+
+  /**
+   * RNG adapter for the model compiler.
+   *
+   * `buildSoldier` needs `fork()`, `float()`, `int()` and `range()`. Core `Rng`
+   * is not guaranteed to expose all four — `_seed32` above exists precisely
+   * because it turned out not to have `uint32()` — and a missing method inside
+   * a geometry build is an exception during a spawn, i.e. a dead raid. Same
+   * defensive pattern as `_seed32` and `_wep`: prefer the native method, derive
+   * the rest, warn once.
+   */
+  _soldierRng(src) {
+    const base = src || this.rng
+    const self = this
+    const float = () => {
+      if (base && typeof base.float === 'function') return base.float()
+      if (base && typeof base.u32 === 'function') return (base.u32() >>> 0) / (UINT32_MAX + 1)
+      self._warnOnce('mesh:rng', 'у rng нет float()/u32() — геометрия актора теряет детерминизм')
+      return Math.random()
+    }
+    const api = {
+      float,
+      int: (a, b) => {
+        if (base && typeof base.int === 'function') return base.int(a, b)
+        return a + Math.floor(float() * (b - a + 1))
+      },
+      range: (a, b) => {
+        if (base && typeof base.range === 'function') return base.range(a, b)
+        return a + float() * (b - a)
+      },
+      u32: () => {
+        if (base && typeof base.u32 === 'function') return base.u32() >>> 0
+        return Math.floor(float() * UINT32_MAX) >>> 0
+      },
+      fork: (tag) => {
+        if (base && typeof base.fork === 'function') return self._soldierRng(base.fork(tag))
+        return api
+      },
+    }
+    return api
+  }
+
+  /**
+   * The shared procedural material set, baked once.
+   *
+   * `CAMO_BAKES` is passed explicitly and that is the load-bearing part: the
+   * constructor's default is `['arid','woodland']` and `get()` throws on a set
+   * it never baked, so any urban kit would otherwise fail on first compile.
+   */
+  soldierMaterials() {
+    if (this._soldierMats) return this._soldierMats
+    const shared = this.ctx && typeof this.ctx.peek === 'function' ? this.ctx.peek('materials') : null
+    if (shared && typeof shared.get === 'function' && shared.sets) {
+      // the render layer already owns a compatible set — reuse it rather than
+      // paying for a second CPU bake
+      this._soldierMats = shared
+      return this._soldierMats
+    }
+    try {
+      this._soldierMats = new SoldierMaterials(this._soldierRng(this.rng).fork('mat'), { camo: CAMO_BAKES })
+    } catch (err) {
+      this._warnOnce('mesh:mats', 'не удалось испечь материалы актора: ' + err.message)
+      this._soldierMats = null
+    }
+    return this._soldierMats
+  }
+
+  /**
+   * Build (and cache) one visual variant.
+   *
+   * ONE GEOMETRY PER VARIANT, shared by every actor wearing it; only the
+   * skeleton is per-instance. Cached on the variant key alone, which is why
+   * `buildSoldier` must not branch geometry on anything per-actor: the first
+   * actor to ask for a key decides what every later one looks like. Faction
+   * differences are therefore separate keys, not per-instance rolls.
+   *
+   * @param name  variant key ('scav_civ', 'raider', 'boss_killa', ...)
+   * @param rng   optional deterministic source; defaults to the AI stream
+   * @param opts  { faction, subtype, armorZones } forwarded to the compiler
+   */
+  variant(name, rng, opts = {}) {
+    const key = VARIANTS[name] ? name : this.factionVariant(opts.faction, rng)
+    const hit = this._variantCache.get(key)
+    if (hit) return hit
+    const materials = this.soldierMaterials()
+    if (!materials) return null
+    let built = null
+    try {
+      built = buildSoldier(key, {
+        rng: this._soldierRng(rng),
+        materials,
+        faction: opts.faction,
+        subtype: opts.subtype,
+        armorZones: opts.armorZones,
+      })
+    } catch (err) {
+      this._warnOnce('mesh:build:' + key, `не удалось собрать модель "${key}": ` + err.message)
+      return null
+    }
+    this._variantCache.set(key, built)
+    return built
+  }
+
+  /**
+   * Pick a mesh variant for a faction.
+   *
+   * Scavs roll between their four silhouettes so a wave is not four copies of
+   * one civilian; every other faction has a single canonical kit. The armoured
+   * scav key is only reachable through `variant()` being asked for it directly,
+   * because the PACA is gated on the actor's own armour roll.
+   */
+  factionVariant(faction, rng) {
+    const id = typeof faction === 'number' ? FACTION_ID[faction] : faction
+    const pool = KITS_BY_FACTION[id]
+    if (!pool || !pool.length) return 'pmc'
+    if (pool.length === 1) return pool[0]
+    const r = this._soldierRng(rng)
+    return pool[r.int(0, pool.length - 1)]
+  }
+
+  /**
+   * Compile every variant's shader programs while a loading screen is up.
+   *
+   * Materials only — NO geometry. Geometry construction draws from the shared
+   * RNG stream, so building it early would move every downstream random draw
+   * and change the picture; `resolveMaterials` was split out of `buildSoldier`
+   * for exactly this call.
+   */
+  prewarmMaterials(renderer, scene, camera) {
+    if (this._prewarmed) return 0
+    const materials = this.soldierMaterials()
+    if (!materials) return 0
+    const seen = new Set()
+    const list = []
+    for (const name of Object.keys(VARIANTS)) {
+      let mats = null
+      try {
+        mats = resolveMaterials(name, ['cloth', 'gear', 'boot', 'rubber', 'plate', 'polymer', 'skin', 'glass', 'steel'], materials)
+      } catch (err) {
+        this._warnOnce('mesh:prewarm:' + name, `материалы варианта "${name}" не разрешились: ` + err.message)
+        continue
+      }
+      for (const m of mats) {
+        if (m && !seen.has(m.uuid)) {
+          seen.add(m.uuid)
+          list.push(m)
+        }
+      }
+    }
+    this._prewarmed = true
+    if (renderer && scene && camera && typeof renderer.compile === 'function') {
+      try {
+        renderer.compile(scene, camera)
+      } catch (err) {
+        this._warnOnce('mesh:compile', 'renderer.compile бросил исключение: ' + err.message)
+      }
+    }
+    return list.length
+  }
+
+  /** Drop cached variant geometry and the baked material set. */
+  disposeSoldierCache() {
+    for (const built of this._variantCache.values()) {
+      if (built && built.geometry && typeof built.geometry.dispose === 'function') built.geometry.dispose()
+    }
+    this._variantCache.clear()
+    // only dispose a set we baked ourselves; a shared one belongs to render
+    const shared = this.ctx && typeof this.ctx.peek === 'function' ? this.ctx.peek('materials') : null
+    if (this._soldierMats && this._soldierMats !== shared && typeof this._soldierMats.dispose === 'function') {
+      this._soldierMats.dispose()
+    }
+    this._soldierMats = null
+    this._prewarmed = false
+  }
+
   /* ---------- спавн ---------- */
   spawnWave({ faction, mapId, night } = {}) {
     this.playerFaction = faction === 'scav' ? FACTION.SCAV : FACTION.PMC;
@@ -225,6 +456,9 @@ export class AiSystem {
     const d = DEF[kind] ?? DEF[FACTION.SCAV];
     const bot = this.free.pop() ?? this._createBot();
     bot.kind = kind;
+    // canonical archetype id, so anything downstream reads a faction rather
+    // than guessing from the numeric kind
+    bot.faction = FACTION_ID[kind] ?? 'scav';
     bot.hp = d.hp;
     bot.state = S_PATROL;
     bot.alive = true;
@@ -290,6 +524,7 @@ export class AiSystem {
       head,
       collider,
       kind: FACTION.SCAV,
+      faction: 'scav',
       hp: 0,
       state: S_IDLE,
       alive: false,
@@ -671,7 +906,7 @@ export class AiSystem {
     bot.alive = false;
     bot.state = S_DEAD;
     this._syncBot(bot);
-    this.ctx.events.emit('actor:death', { actor: bot, point: bot.root.position });
+    this.ctx.events.emit('actor:death', { actor: bot, point: bot.root.position, faction: bot.faction });
     if (byPlayer) {
       if (this.playerFaction === FACTION.SCAV && bot.kind === FACTION.SCAV) this.angerScavs('scav_kill');
       if (this.playerFaction === FACTION.SCAV && bot.kind === FACTION.RAIDER)
@@ -697,6 +932,7 @@ export class AiSystem {
 
   dispose() {
     this.clear();
+    this.disposeSoldierCache();
     for (const b of this.free) {
       if (this.world && typeof this.world.disposeActor === 'function') this.world.disposeActor(b);
       if (b.collider && this.physics && typeof this.physics.removeCollider === 'function') {
