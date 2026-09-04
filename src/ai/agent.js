@@ -1,7 +1,7 @@
 /**
  * Agent - one AI actor.
  *
- * Three things changed in this file and they are worth stating plainly.
+ * Four things changed in this file and they are worth stating plainly.
  *
  * E1. `variantName` no longer decides anything. It used to be asked
  *     `=== 'irregular'` in three separate places to pick a fire rate and a
@@ -20,6 +20,47 @@
  * E3. When this actor spots the player it shouts, and the shout is the only
  *     thing that reaches anyone else. There is no direct write into another
  *     agent anywhere in this file.
+ *
+ * E4. THE ROOF TELEPORT IS FIXED, and it is worth being precise about what the
+ *     bug actually was, because the symptom and the cause were in different
+ *     methods.
+ *
+ *     `_tryVault()` cast one probe at y + 0.35, one at y + 1.15, and if the low
+ *     one was blocked while the high one was clear it wrote
+ *     `this.root.position.y += 0.55` and shoved the actor 0.35 m further along
+ *     its heading. Two things are wrong with that. The obvious one: 0.55 m is
+ *     not a step, it is a chest-high hop, and nothing bounded it against the
+ *     obstacle actually being 0.2 m tall. The one that produced the teleport:
+ *     when BOTH probes were blocked - a wall - the method returned false, but
+ *     `_move()` had already advanced the actor INTO the wall on the line above.
+ *     The ground re-probe that follows asks for the surface height under that
+ *     sample, a ground query answers with the highest surface it finds, and
+ *     inside a building footprint the highest surface is the ROOF. So the bot
+ *     did not jump - it was placed inside solid geometry and then snapped to
+ *     the apex vertex above it, every frame it kept pushing.
+ *
+ *     That also explains the WebGL program errors that came with it. Once y is
+ *     resolved off a roof 12 m up (or off a NaN, when the probe missed the
+ *     world entirely), the bone matrices this actor feeds the skinning shader
+ *     go with it, and a non-finite matrix is a non-finite attribute upload.
+ *
+ *     The fix is three independent gates, because one of them can always be
+ *     unavailable:
+ *
+ *       1. `_tryVault()` probes forward at ground + `VAULT.STEP_CEILING` and
+ *          NEVER higher, checks clearance at ground + `VAULT.CLEARANCE`, and
+ *          treats low-blocked + high-blocked as a wall: no vertical write, the
+ *          horizontal step is rolled back, `desiredSpeed` is forced to 0 and a
+ *          lateral redirection path is requested.
+ *       2. a step is only taken when the measured rise ahead is inside the same
+ *          ceiling, so the maximum the actor can ever gain in one frame is
+ *          `VAULT.STEP_CEILING` metres.
+ *       3. the ground re-probe in `_move()` rejects any rise above that ceiling
+ *          outright, which kills the snap even in a build where
+ *          `physics.lineOfSight()` is missing and gate 1 cannot run at all.
+ *
+ *     `_sanitize()` then guarantees the transform this actor hands the renderer
+ *     is finite, rolling back to the last good pose rather than shipping NaN.
  */
 
 import * as THREE from 'three'
@@ -58,6 +99,40 @@ export const STATE = Object.freeze({
 export const DEG = Math.PI / 180
 
 /**
+ * MAXIMUM OBSTACLE HEIGHT CEILING and the probe geometry around it.
+ *
+ * `STEP_CEILING` is the single number that makes the roof teleport impossible:
+ * it is both the height the forward probe is cast at and the largest vertical
+ * gain any single frame is allowed to apply, whichever path resolved it. A kerb
+ * or a low pallet is 0.15-0.40 m and passes; a crate lip, a window sill, a
+ * balustrade and a wall are all above it and are refused as walls.
+ *
+ * `CLEARANCE` is the second probe. A step has air above it, a wall does not, and
+ * 1.2 m is the height at which that distinction stops being ambiguous: it is
+ * above every legitimate step this game has and below the head of every actor,
+ * so a blocked clearance probe means the obstruction continues through the
+ * volume the body would have to occupy.
+ */
+export const VAULT = Object.freeze({
+  /** metres above the actor's own ground level - the ceiling, and the low probe */
+  STEP_CEILING: 0.45,
+  /** metres above ground for the high clearance probe */
+  CLEARANCE: 1.2,
+  /** how far ahead both probes reach */
+  PROBE: 0.9,
+  /** how far a legitimate step is allowed to carry the actor forward */
+  STEP_ASSIST: 0.18,
+  /** chest height for the lateral detour probes */
+  DETOUR_Y: 0.95,
+  /** how far sideways a detour target is placed */
+  DETOUR_REACH: 3.4,
+  /** how much of the blocked heading is kept in the detour target */
+  DETOUR_BIAS: 0.6,
+  /** seconds between redirection requests, so a cornered bot cannot spam A* */
+  REDIRECT_COOLDOWN: 0.65,
+})
+
+/**
  * Hit capsules. `region` is the string handed to applyDamage and resolved by the
  * anatomy; `mult` is the ballistic multiplier the bullet path applies.
  */
@@ -80,6 +155,36 @@ export const DOLL = Object.freeze([
   'thighR', 'shinR', 'footR', 'toeR',
 ])
 
+/**
+ * Which body the faction wears.
+ *
+ * Visual only, and deliberately several keys per faction: the soldier builder
+ * caches one geometry per key, so a handful of keys is how a raid gets scavs in
+ * mismatched civilian layers instead of one clone stamped twelve times. The
+ * armoured scav key is only ever requested when `_armorZones` actually came
+ * back with a plated zone, which is what keeps a PACA off an unarmoured scav.
+ */
+export const FACTION_MESH = Object.freeze({
+  scav: Object.freeze(['scav_civ', 'scav_track', 'scav_jeans']),
+  raider: Object.freeze(['raider']),
+  pmc: Object.freeze(['pmc']),
+  boss: Object.freeze(['boss_killa', 'boss_shturman']),
+})
+
+/** Scav mesh worn when a plate actually rolled. */
+export const SCAV_ARMORED_MESH = 'scav_paca'
+
+/**
+ * Last-resort mesh key per faction. A host that only knows the three original
+ * silhouettes still gets a body out of `ai.variant()` rather than a capsule.
+ */
+export const MESH_FALLBACK = Object.freeze({
+  scav: 'irregular',
+  raider: 'vanguard',
+  pmc: 'vanguard',
+  boss: 'breacher',
+})
+
 let _nextId = 1
 
 const _v = new THREE.Vector3()
@@ -89,6 +194,9 @@ const _right = new THREE.Vector3()
 const _aim = new THREE.Vector3()
 const _up = new THREE.Vector3(0, 1, 0)
 const _m = new THREE.Matrix4()
+const _low = new THREE.Vector3()
+const _high = new THREE.Vector3()
+const _ahead = new THREE.Vector3()
 
 function fallbackRng(seed) {
   let a = seed >>> 0 || 0x9e3779b9
@@ -129,9 +237,9 @@ export class Agent {
     this.subtypeId = this.subtype ? this.subtype.id : null
     this.voice = voiceFor(arch, this.subtype)
     /**
-     * Visual only. `ai.variant()` keys the soldier build off this string and
-     * existing map spawns still pass 'vanguard' / 'irregular', so the mesh a
-     * spawn point produces is unchanged. Nothing branches on it.
+     * Visual only. Existing map spawns still pass 'vanguard' / 'irregular', so
+     * this stays exactly what the archetype declares and remains the fallback
+     * key. Nothing branches on it.
      */
     this.variantName = arch.variant
 
@@ -175,6 +283,20 @@ export class Agent {
     })
     this.armorClass = this.anatomy.armorClass
 
+    /**
+     * Which zones actually ended up plated on THIS actor.
+     *
+     * The archetype lists which zones *can* be plated; the class roll decides
+     * whether anything was. A scav rolling class 0 is a scav in a jacket, and
+     * the model compiler reads this array to decide whether it is allowed to
+     * compile any armour mesh at all for them.
+     */
+    this._armorZones =
+      this.armorClass > 0 && Array.isArray(arch.armor.parts) ? arch.armor.parts.slice() : []
+
+    /** Faction mesh kit key handed to `ai.variant()`. */
+    this.buildVariant = this._pickBuildVariant()
+
     /* ---- state ---- */
 
     this.state = STATE.IDLE
@@ -217,6 +339,22 @@ export class Agent {
     this.height = 1.8 * this.bodyScale
     this.radius = 0.34 * this.bodyScale
 
+    /* ---- E4: vault / wall state ---- */
+
+    /** True for the frame a wall refused this actor's step. */
+    this.blockedByWall = false
+    /** Seconds until another redirection request is allowed. */
+    this._redirectCooldown = 0
+    /** Which way the next detour tries first; flipped on use. */
+    this._detourSide = this.rng.float() < 0.5 ? -1 : 1
+    /** The actor's own ground level for this frame, captured before it steps. */
+    this._groundY = 0
+    /** Pose before the step, so a refused move can be rolled back exactly. */
+    this._preStep = new THREE.Vector3()
+    /** Last known finite pose, for `_sanitize()`. */
+    this._lastGood = new THREE.Vector3()
+    this._vaultBusy = false
+
     this.lodIrrelevant = false
     this._animSkip = 0
     this._animAccum = 0
@@ -227,6 +365,9 @@ export class Agent {
     this.root.name = 'agent:' + this.id + ':' + this.faction
     if (opts.position) this.root.position.copy(opts.position)
     if (Number.isFinite(opts.yaw)) this.root.rotation.y = opts.yaw
+    this._groundY = this.root.position.y
+    this._preStep.copy(this.root.position)
+    this._lastGood.copy(this.root.position)
 
     this.mesh = null
     this.skeleton = null
@@ -268,9 +409,51 @@ export class Agent {
     return ai.phys || ai.physics || (ai.ctx ? ai.ctx.physics : null)
   }
 
+  /**
+   * Pick the mesh kit for this actor's faction.
+   *
+   * Scavs draw from the civilian pool unless a plate rolled, in which case they
+   * get the one scav silhouette that is allowed to show armour. Bosses draw a
+   * signature profile - Killa or Shturman - because a boss that looks like a
+   * raider is not a boss.
+   */
+  _pickBuildVariant() {
+    if (this.faction === 'scav' && this._armorZones.length > 0) return SCAV_ARMORED_MESH
+    const pool = FACTION_MESH[this.faction]
+    if (!pool || pool.length === 0) return this.variantName
+    if (pool.length === 1) return pool[0]
+    const i = Math.min(pool.length - 1, Math.floor(this.rng.float() * pool.length))
+    return pool[i]
+  }
+
   _buildBody() {
     const ai = this.ai
-    const built = ai && typeof ai.variant === 'function' ? ai.variant(this.variantName, this.rng) : null
+    if (!ai || typeof ai.variant !== 'function') return
+
+    /**
+     * Faction key first, archetype key second, faction fallback last. A host
+     * that knows the faction kits builds one; a host that only knows the three
+     * original silhouettes still gets a body, and nobody gets a null mesh.
+     */
+    const keys = []
+    for (const k of [this.buildVariant, this.variantName, MESH_FALLBACK[this.faction]]) {
+      if (k && keys.indexOf(k) < 0) keys.push(k)
+    }
+
+    let built = null
+    for (let i = 0; i < keys.length && !built; i++) {
+      try {
+        built = ai.variant(keys[i], this.rng, {
+          faction: this.faction,
+          subtype: this.subtypeId,
+          armorZones: this._armorZones,
+          armorClass: this.armorClass,
+        })
+        if (built) this.buildVariant = keys[i]
+      } catch (err) {
+        built = null
+      }
+    }
     if (!built) return
 
     if (built.isObject3D) {
@@ -381,6 +564,7 @@ export class Agent {
     if (this._voice) this._voice.update(dt)
     if (this.suppression > 0) this.suppression = Math.max(0, this.suppression - dt * 0.85)
     if (this.grenadeCooldown > 0) this.grenadeCooldown -= dt
+    if (this._redirectCooldown > 0) this._redirectCooldown -= dt
 
     this._sense(dt)
     this._think(dt)
@@ -699,9 +883,13 @@ export class Agent {
   }
 
   _move(dt) {
+    this.blockedByWall = false
+
     if (!this.hasGoal) {
       this.desiredSpeed = 0
       this.speed += (0 - this.speed) * Math.min(1, dt * 6)
+      this._groundY = this.root.position.y
+      this._sanitize()
       return
     }
 
@@ -747,17 +935,28 @@ export class Agent {
     this.speed += (want - this.speed) * Math.min(1, dt * 5)
     this.velocity.copy(_v).multiplyScalar(this.speed)
 
+    /**
+     * E4. The actor's own ground level and its exact pre-step pose are captured
+     * BEFORE it moves. Everything downstream measures against `_groundY`, and a
+     * refused step is rolled back to `_preStep` rather than nudged - a partial
+     * rollback is how a bot ends up a few centimetres inside a wall, which is
+     * all the ground probe needs to answer with the roof.
+     */
+    this._groundY = this.root.position.y
+    this._preStep.copy(this.root.position)
+
     const step = this.speed * dt
     this.root.position.addScaledVector(_v, step)
     this._tryVault(_v)
+    if (this.blockedByWall) {
+      this._sanitize()
+      return
+    }
 
-    const ai = this.ai
-    if (ai && typeof ai.groundAt === 'function') {
-      const y = ai.groundAt(this.root.position.x, this.root.position.z)
-      if (Number.isFinite(y)) this.root.position.y = y
-    } else if (ai && typeof ai.probeGround === 'function') {
-      const hit = ai.probeGround(this.root.position)
-      if (hit && Number.isFinite(hit.y)) this.root.position.y = hit.y
+    this._resolveGround(_v)
+    if (this.blockedByWall) {
+      this._sanitize()
+      return
     }
 
     // face where we are going unless we are shooting, then face the target
@@ -772,22 +971,246 @@ export class Agent {
       while (diff < -Math.PI) diff += Math.PI * 2
       this.root.rotation.y += diff * Math.min(1, dt * 7)
     }
+
+    this._sanitize()
   }
 
+  /**
+   * Ask the host how high the ground is under the new sample, and refuse the
+   * answer if it is a roof.
+   *
+   * This is gate 3, and it is the one that cannot be bypassed. A ground query
+   * returns the HIGHEST surface beneath the sample point, so the moment an actor
+   * is standing inside a building footprint the honest answer is the roof, and
+   * assigning it is the teleport. Downward moves are always allowed - that is a
+   * kerb, a ramp or a drop, all legitimate - but a rise above
+   * `VAULT.STEP_CEILING` is not a floor this actor could have walked onto, so
+   * the step that produced it is rolled back and the actor redirects.
+   */
+  _resolveGround(dir) {
+    const ai = this.ai
+    let ground = NaN
+    if (ai && typeof ai.groundAt === 'function') {
+      const y = ai.groundAt(this.root.position.x, this.root.position.z)
+      if (Number.isFinite(y)) ground = y
+    } else if (ai && typeof ai.probeGround === 'function') {
+      const hit = ai.probeGround(this.root.position)
+      if (hit && Number.isFinite(hit.y)) ground = hit.y
+    }
+    if (!Number.isFinite(ground)) {
+      // no ground under the sample at all: keep the height we came in with
+      // rather than inheriting a NaN and poisoning the skinning matrices
+      this.root.position.y = this._groundY
+      return
+    }
+
+    const rise = ground - this._groundY
+    if (rise > VAULT.STEP_CEILING) {
+      this._wallStop(dir)
+      return
+    }
+    this.root.position.y = ground
+    this.grounded = true
+  }
+
+  /**
+   * MAXIMUM OBSTACLE HEIGHT CEILING.
+   *
+   * Two probes, both cast from the actor's own ground level, both reaching
+   * `VAULT.PROBE` metres along the heading it is trying to travel:
+   *
+   *   low   ground + VAULT.STEP_CEILING (0.45 m) - never higher. This is the
+   *         tallest thing that can possibly be a step, so anything it clears is
+   *         not an obstruction worth reacting to.
+   *   high  ground + VAULT.CLEARANCE (1.2 m) - is there body-height air above
+   *         whatever the low probe found?
+   *
+   *   low clear                  -> nothing in the way. Do nothing.
+   *   low blocked, high BLOCKED  -> WALL. No vertical write of any kind, the
+   *                                 step is rolled back, desiredSpeed is forced
+   *                                 to 0 and a redirection path is requested.
+   *   low blocked, high clear    -> candidate step. Measure the rise ahead and
+   *                                 only take it if it is inside the ceiling;
+   *                                 if it is not, or if it cannot be measured,
+   *                                 treat it as a wall.
+   *
+   * The old code's `this.root.position.y += 0.55` has no successor here. Height
+   * is never accumulated - it is resolved to a measured floor, once, and only
+   * when that floor is within reach of a stride.
+   *
+   * @returns true when a step was accepted, false otherwise
+   */
   _tryVault(dir) {
+    if (this._vaultBusy) return false
     const phys = this._physics()
     if (!phys || typeof phys.lineOfSight !== 'function') return false
-    _v2.copy(this.root.position)
-    _v2.y += 0.35
-    _aim.copy(_v2).addScaledVector(dir, 0.9)
-    if (this._lineOfSight(_v2, _aim)) return false
-    // low obstruction, clear above it - step up rather than stall
-    _v2.y = this.root.position.y + 1.15
-    _aim.copy(_v2).addScaledVector(dir, 0.9)
-    if (!this._lineOfSight(_v2, _aim)) return false
-    this.root.position.y += 0.55
-    this.root.position.addScaledVector(dir, 0.35)
+    if (!dir) return false
+
+    this._vaultBusy = true
+    try {
+      _v2.copy(dir)
+      _v2.y = 0
+      if (_v2.lengthSq() < 1e-8) return false
+      _v2.normalize()
+
+      const groundY = Number.isFinite(this._groundY) ? this._groundY : this.root.position.y
+      const px = this._preStep.x
+      const pz = this._preStep.z
+
+      // ---- low probe: strictly at the step ceiling, never above it ----------
+      _low.set(px, groundY + VAULT.STEP_CEILING, pz)
+      _aim.copy(_low).addScaledVector(_v2, VAULT.PROBE)
+      if (this._lineOfSight(_low, _aim)) return false
+
+      // ---- high clearance probe -------------------------------------------
+      _high.set(px, groundY + VAULT.CLEARANCE, pz)
+      _aim.copy(_high).addScaledVector(_v2, VAULT.PROBE)
+      if (!this._lineOfSight(_high, _aim)) {
+        // BOTH blocked. This is a wall, not a step. Terminate here: no vertical
+        // warping, no forward assist, nothing written to position.y at all.
+        this._wallStop(_v2)
+        return false
+      }
+
+      // ---- candidate step: it has to be measurable AND inside the ceiling --
+      const ai = this.ai
+      _ahead.set(px, groundY, pz).addScaledVector(_v2, VAULT.PROBE * 0.75)
+      let top = NaN
+      if (ai && typeof ai.groundAt === 'function') {
+        const y = ai.groundAt(_ahead.x, _ahead.z)
+        if (Number.isFinite(y)) top = y
+      } else if (ai && typeof ai.probeGround === 'function') {
+        const hit = ai.probeGround(_ahead)
+        if (hit && Number.isFinite(hit.y)) top = hit.y
+      }
+
+      // Unmeasurable is refused, not guessed. Guessing is what put actors on
+      // roofs in the first place.
+      if (!Number.isFinite(top)) {
+        this._wallStop(_v2)
+        return false
+      }
+
+      const rise = top - groundY
+      if (rise > VAULT.STEP_CEILING) {
+        this._wallStop(_v2)
+        return false
+      }
+
+      // A real step. Resolve to the measured surface - which by the test above
+      // is at most VAULT.STEP_CEILING above where the actor was standing - and
+      // give it just enough forward assist to clear the lip.
+      if (rise > 0) {
+        this.root.position.y = top
+        this.root.position.addScaledVector(_v2, VAULT.STEP_ASSIST)
+        this._groundY = top
+      }
+      this.grounded = true
+      return true
+    } finally {
+      this._vaultBusy = false
+    }
+  }
+
+  /**
+   * A wall refused this actor's step.
+   *
+   * Roll the pose back exactly, stop, and go around. `desiredSpeed` is forced to
+   * zero so the animation layer stops playing a walk cycle into masonry, and the
+   * redirection is rate-limited so a bot wedged in a corner cannot issue an A*
+   * request every frame.
+   */
+  _wallStop(dir) {
+    this.root.position.copy(this._preStep)
+    this.blockedByWall = true
+    this.grounded = true
+    this.desiredSpeed = 0
+    this.speed = 0
+    this.velocity.set(0, 0, 0)
+    this._redirect(dir)
+
+    const bus = this._bus()
+    if (bus && typeof bus.emit === 'function') {
+      bus.emit('ai:blocked', {
+        actor: this,
+        faction: this.faction,
+        position: this.root.position,
+        ceiling: VAULT.STEP_CEILING,
+      })
+    }
+  }
+
+  /**
+   * Go around it.
+   *
+   * A lateral detour target at chest height on whichever side is actually open,
+   * alternating which side is tried first so an actor in a re-entrant corner
+   * walks out of it instead of oscillating. If both sides are shut it backs off
+   * along its own heading, which is always open - it just came from there.
+   */
+  _redirect(dir) {
+    if (this._redirectCooldown > 0) return false
+    this._redirectCooldown = VAULT.REDIRECT_COOLDOWN
+
+    this.path = null
+    this.pathIndex = 0
+    this.repathTimer = 0
+
+    _v2.copy(dir || _fwd)
+    _v2.y = 0
+    if (_v2.lengthSq() < 1e-8) _v2.set(0, 0, 1)
+    _v2.normalize()
+    _right.crossVectors(_v2, _up).normalize()
+
+    const pos = this.root.position
+    _low.set(pos.x, pos.y + VAULT.DETOUR_Y, pos.z)
+
+    for (let i = 0; i < 2; i++) {
+      const side = i === 0 ? this._detourSide : -this._detourSide
+      _aim
+        .copy(_low)
+        .addScaledVector(_right, side * VAULT.DETOUR_REACH)
+        .addScaledVector(_v2, VAULT.DETOUR_BIAS)
+      if (!this._lineOfSight(_low, _aim)) continue
+      this._detourSide = -side
+      _ahead.set(_aim.x, pos.y, _aim.z)
+      this._goTo(_ahead)
+      return true
+    }
+
+    // boxed in: retreat along the heading we arrived on
+    _ahead.copy(pos).addScaledVector(_v2, -VAULT.DETOUR_REACH * 0.6)
+    _ahead.y = pos.y
+    this._detourSide = -this._detourSide
+    this._goTo(_ahead)
     return true
+  }
+
+  /**
+   * The transform this actor hands the renderer is finite, or it is the last one
+   * that was.
+   *
+   * A single NaN in `root.position` propagates into every bone matrix on the
+   * next `syncHitboxes()` / skinning update, and a non-finite attribute upload
+   * is exactly what the console reports as a WebGL program execution error. Far
+   * better to hold the previous pose for a frame than to ship garbage to the
+   * GPU.
+   */
+  _sanitize() {
+    const p = this.root.position
+    if (Number.isFinite(p.x) && Number.isFinite(p.y) && Number.isFinite(p.z)) {
+      this._lastGood.copy(p)
+      return true
+    }
+    p.copy(this._lastGood)
+    this.velocity.set(0, 0, 0)
+    this.speed = 0
+    this.desiredSpeed = 0
+    this._groundY = p.y
+    this.path = null
+    this.pathIndex = 0
+    this.hasGoal = false
+    return false
   }
 
   /* ================= weapon ================= */
@@ -986,6 +1409,7 @@ export class Agent {
         // what the corpse is worth looting - a scav's rattling rifle is not
         weaponDurability: this.weaponDurability,
         armorClass: this.armorClass,
+        armorZones: this._armorZones,
       })
     }
 
