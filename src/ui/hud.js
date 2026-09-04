@@ -84,11 +84,16 @@ export class Hud {
     this.root = null;
     this.visible = false;
     this._ownsRoot = false;             // контейнер создали мы — нам его и убирать
+    this.tabletOpen = false
+    this._onTabletKey = null
+    this._onTabletRequest = null
+    this._offState = null
   }
 
   init(ctx) {
     this.ctx = ctx || this.ctx;
     this.mount();
+    this._bindTablet()
     return this;
   }
 
@@ -176,6 +181,53 @@ export class Hud {
     return this;
   }
 
+  _bindTablet() {
+    if (typeof window === 'undefined' || this._onTabletKey) return
+
+    this._onTabletKey = (event) => {
+      const key = (event.key || '').toLowerCase()
+      if (key !== 'm' && key !== 'ь' && !(key === 'escape' && this.tabletOpen)) return
+      const tag = document.activeElement?.tagName || ''
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+      if (!this.tabletOpen && this.ctx?.engine?.state !== 'gameplay') return
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      this._setTabletOpen(key === 'escape' ? false : !this.tabletOpen)
+    }
+
+    this._onTabletRequest = (event) => {
+      this._setTabletOpen(event.detail?.open !== false)
+    }
+
+    window.addEventListener('keydown', this._onTabletKey, true)
+    window.addEventListener('efl:diagnostics-request', this._onTabletRequest)
+    this._offState = this.ctx?.events?.on?.('state', ({ to }) => {
+      if (to !== 'gameplay' && this.tabletOpen) this._setTabletOpen(false)
+    })
+  }
+
+  _setTabletOpen(open) {
+    const want = !!open
+    if (want && this.ctx?.engine?.state !== 'gameplay') return false
+    if (want === this.tabletOpen) return want
+    this.tabletOpen = want
+
+    const input = this.ctx?.input
+    if (input) {
+      input.enabled = !want
+      input.frozen = want
+      if (want) input.pointerLocked = false
+    }
+    if (want) {
+      try { document.exitPointerLock?.() } catch {}
+    }
+
+    window.dispatchEvent(new CustomEvent('efl:diagnostics', {
+      detail: { open: want, tab: 'gps', ctx: this.ctx },
+    }))
+    return want
+  }
+
   /** HUD обновляется 10 раз в секунду, а не каждый кадр,
    *  и пишет в DOM только изменившиеся поля. */
   update(dt) {
@@ -220,6 +272,15 @@ export class Hud {
   }
 
   dispose() {
+    if (this.tabletOpen) this._setTabletOpen(false)
+    if (this._onTabletKey && typeof window !== 'undefined') {
+      window.removeEventListener('keydown', this._onTabletKey, true)
+      window.removeEventListener('efl:diagnostics-request', this._onTabletRequest)
+    }
+    if (typeof this._offState === 'function') this._offState()
+    this._onTabletKey = null
+    this._onTabletRequest = null
+    this._offState = null
     if (this._ownsRoot && this.root && this.root.parentNode) {
       this.root.parentNode.removeChild(this.root);
     }
