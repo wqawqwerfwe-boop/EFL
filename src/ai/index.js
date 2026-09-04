@@ -85,9 +85,6 @@ export class AiSystem {
     this.scavKarmaHostile = false;       // стал ли игрок-Дикий врагом для Диких
     this.playerFaction = FACTION.PMC;
     this._botSeq = 1;
-    this._botBodyGeo = new THREE.CylinderGeometry(0.34, 0.39, 1.52, 8, 1);
-    this._botHeadGeo = new THREE.SphereGeometry(0.21, 8, 6);
-    this._botMat = new THREE.MeshStandardMaterial({ color: 0x6c7862, roughness: 0.96, metalness: 0.02 });
 
     // Кэш скомпилированных вариантов модели и общий набор материалов.
     // Геометрия одна на вариант: скелет — на экземпляр. See variant().
@@ -474,6 +471,7 @@ export class AiSystem {
     // canonical archetype id, so anything downstream reads a faction rather
     // than guessing from the numeric kind
     bot.faction = FACTION_ID[kind] ?? 'scav';
+    this._attachFactionVisual(bot)
     bot.hp = d.hp;
     bot.state = S_PATROL;
     bot.alive = true;
@@ -510,16 +508,6 @@ export class AiSystem {
     const root = new THREE.Group();
     root.name = `bot:${this._botSeq}`;
     root.visible = false;
-    const body = new THREE.Mesh(this._botBodyGeo, this._botMat);
-    body.position.y = 0.78;
-    body.castShadow = true;
-    body.receiveShadow = true;
-    const head = new THREE.Mesh(this._botHeadGeo, this._botMat);
-    head.position.y = 1.6;
-    head.castShadow = true;
-    head.receiveShadow = true;
-    root.add(body);
-    root.add(head);
 
     const collider = this.physics.addCollider({
       shape: 'capsule',
@@ -535,8 +523,10 @@ export class AiSystem {
     const bot = {
       id: this._botSeq++,
       root,
-      body,
-      head,
+      body: null,
+      head: null,
+      actorData: null,
+      visualKey: '',
       collider,
       kind: FACTION.SCAV,
       faction: 'scav',
@@ -568,6 +558,61 @@ export class AiSystem {
     collider.owner = bot;
     root.userData.bot = bot;
     return bot;
+  }
+
+  _attachFactionVisual(bot) {
+    if (!bot?.root) return null
+
+    let profile = 'civ'
+    let armorZones = []
+    if (bot.faction === 'scav') {
+      profile = ['civ', 'track', 'jeans'][bot.id % 3]
+      if (profile === 'jeans' && bot.id % 2 === 0) armorZones = ['thorax']
+    } else if (bot.faction === 'raider') {
+      profile = 'black'
+      armorZones = ['thorax', 'stomach', 'head']
+    } else if (bot.faction === 'pmc') {
+      profile = bot.id % 2 ? 'usec' : 'bear'
+      armorZones = ['thorax', 'stomach']
+    } else if (bot.faction === 'boss') {
+      profile = bot.id % 2 ? 'killa' : 'shturman'
+      armorZones = profile === 'killa' ? ['thorax', 'stomach', 'head'] : ['thorax']
+    }
+
+    const visualKey = `${bot.faction}:${profile}:${armorZones.join(',')}`
+    if (bot.actorData?.group && bot.visualKey === visualKey) {
+      if (bot.actorData.group.parent !== bot.root) bot.root.add(bot.actorData.group)
+      return bot.actorData
+    }
+
+    if (bot.actorData?.group) {
+      bot.actorData.group.parent?.remove(bot.actorData.group)
+      freeFactionMesh(bot.actorData.group)
+    }
+
+    try {
+      const actorData = compileFactionMesh({
+        faction: bot.faction,
+        profile,
+        armorZones,
+        seed: 0x4f1bbcdc ^ bot.id,
+      })
+      if (!actorData?.group) throw new Error('compiler returned no group')
+      actorData.group.traverse((object) => {
+        if (!object.isMesh) return
+        object.castShadow = true
+        object.receiveShadow = true
+      })
+      bot.actorData = actorData
+      bot.visualKey = visualKey
+      bot.root.add(actorData.group)
+      return actorData
+    } catch (err) {
+      bot.actorData = null
+      bot.visualKey = ''
+      this._warnOnce(`mesh:actor:${bot.id}`, `не удалось собрать faction mesh: ${err.message}`)
+      return null
+    }
   }
 
   _syncBot(bot) {
@@ -950,14 +995,15 @@ export class AiSystem {
     this.disposeSoldierCache();
     for (const b of this.free) {
       if (this.world && typeof this.world.disposeActor === 'function') this.world.disposeActor(b);
+      if (b.actorData?.group) {
+        freeFactionMesh(b.actorData.group)
+        b.actorData = null
+      }
       if (b.collider && this.physics && typeof this.physics.removeCollider === 'function') {
         this.physics.removeCollider(b.collider);
       }
     }
     this.free.length = 0;
-    this._botBodyGeo.dispose();
-    this._botHeadGeo.dispose();
-    this._botMat.dispose();
     const e = this.ctx.events;
     e.off('weapon:fire', this._onFire); e.off('explosion', this._onBoom);
     e.off('raid:start', this._onRaid);  e.off('raid:end', this._onEnd);

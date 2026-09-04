@@ -388,6 +388,18 @@ export function resolveArchetype(opts, rng) {
 	return ARCHETYPES[DEFAULT_ARCHETYPE]
 }
 
+/** Compatibility roll consumed by the reference vault and faction panels. */
+export function rollArmorZones(faction, rng = Math.random) {
+	const a = resolveArchetype(faction)
+	const roll = typeof rng === 'function' ? rng() : rfloat(rng)
+	const maxClass = a?.armor?.max ?? 0
+	const chance = faction === 'scav' ? Math.min(0.55, maxClass * 0.2) : maxClass > 0 ? 1 : 0
+	if (roll > chance) return []
+	if (faction === 'scav') return ['thorax']
+	if (faction === 'pmc') return ['thorax', 'stomach']
+	return ['thorax', 'stomach', 'head']
+}
+
 /** USEC or BEAR. Returns null for archetypes that have no sides. */
 export function rollSubtype(a, rng) {
 	const list = a && a.subtypes

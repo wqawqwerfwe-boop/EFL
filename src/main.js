@@ -1,3 +1,8 @@
+import { createElement } from 'react'
+import { createRoot } from 'react-dom/client'
+import App from './App.tsx'
+import './index.css'
+
 import { Engine, STATE } from './core/engine.js';
 import { createConfig } from './core/config.js';
 import { MainMenuSystem } from './ui/mainMenu.js';
@@ -40,6 +45,10 @@ const config = createConfig({
 });
 
 const engine = new Engine({ canvas: document.getElementById('game'), config });
+
+const diagnosticsHost = document.getElementById('diagnostics-root')
+const diagnosticsRoot = diagnosticsHost ? createRoot(diagnosticsHost) : null
+diagnosticsRoot?.render(createElement(App, { ctx: engine.ctx }))
 
 /* Движок публикуется СРАЗУ, а не в конце модуля.
  *
@@ -135,4 +144,7 @@ if (lockstep) {
   requestAnimationFrame(probe);
 }
 
-if (import.meta.hot) import.meta.hot.dispose(() => engine.dispose());
+if (import.meta.hot) import.meta.hot.dispose(() => {
+  diagnosticsRoot?.unmount()
+  engine.dispose()
+});
