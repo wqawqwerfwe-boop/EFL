@@ -7,41 +7,38 @@
  * patterns over one silhouette — which is why every actor in a raid read as the
  * same operator. It now compiles a silhouette per archetype:
  *
- *   scav    civilian layers. Work jackets, mismatched tracksuits, dirty jeans,
+ *   scav    civilian layers: work jackets, mismatched tracksuits, dirty jeans,
  *           ushankas and beanies, bunched hoods, repair patches, a found
  *           bandolier. NO plate carrier, NO PALS, NO pauldrons, NO knee pads,
  *           and the only armour they can show is a PACA soft vest — gated on
- *           the actor's rolled `_armorZones`, so an unarmoured scav has no
+ *           the actor's rolled `armorZones`, so an unarmoured scav carries no
  *           armour mesh at all.
- *   raider   matching issued kit. Full-cut visored helmet with ear cups and a
+ *   raider  matching issued kit: full-cut visored helmet with ear cups and a
  *           mandible bar, knee pads, heavy modular carrier with side plates and
  *           shoulder pauldrons.
- *   pmc      the reference soldier, unchanged in spirit: high-cut helmet,
- *           goggles, standard carrier.
- *   boss     one signature each. Killa's full-face Maska with the three raised
+ *   pmc     the reference soldier: high-cut helmet, goggles, standard carrier.
+ *   boss    one signature each. Killa's full-face Maska with the three raised
  *           crown stripes; Shturman's open camo coat.
  *
- * WHAT IS DELIBERATELY UNTOUCHED. `vanguard`, `irregular` and `breacher` compile
- * exactly the geometry and materials they did before. Every new part is gated
- * behind a flag no legacy record carries, and `resolveMaterials` keeps its
+ * WHAT IS DELIBERATELY UNTOUCHED. `vanguard`, `irregular` and `breacher`
+ * compile exactly the geometry and materials they did before: every new part is
+ * gated behind a flag no legacy record carries, and `resolveMaterials` keeps its
  * original switch for them. The repo has a pixel gate and an albedo audit
  * (`node src/ai/selftest.mjs`); silently adding a buckle to the reference
  * variants would fail both for no reason.
  *
- * MATERIAL_SLOTS ORDER IS PRESERVED ON EVERY NEW PATH. See the note on that
- * export — it is load-bearing, not cosmetic, and two of the additions below
- * exist purely to hold it:
- *   - the belt buckle is the `polymer` part that keeps polymer ahead of `skin`
- *     for kits that have no magazine pouches (and therefore no spare mag);
- *   - the weapon optic is now added before the weapon steel, so `glass` stays
- *     ahead of `steel` for kits with no goggles, visor or shades. For the legacy
- *     variants glass has already appeared on the head by then, so their order is
- *     unchanged.
+ * MATERIAL_SLOTS ORDER IS HELD ON EVERY NEW PATH — see the note on that export,
+ * it is load-bearing rather than cosmetic. Two additions exist purely to hold
+ * it: the belt buckle is the `polymer` part that keeps polymer ahead of `skin`
+ * for kits with no magazine pouches (and so no spare mag), and the weapon optic
+ * is now added before the weapon steel so `glass` stays ahead of `steel` for
+ * kits with no goggles, visor or shades. For the legacy variants glass has
+ * already appeared on the head by then, so their order does not move.
  */
 
 import * as THREE from 'three'
 import { RIG, GRIP_R, GRIP_L, BORE_DIR } from './rig.js'
-import { CharacterBuilder, Noise, appendMesh, computeNormals, emptyMesh } from './geo.js'
+import { CharacterBuilder, Noise } from './geo.js'
 import * as P from './parts.js'
 import * as F from './factionParts.js'
 import { buildWeapon } from './weapon.js'
@@ -133,16 +130,9 @@ const GEAR = {
 }
 
 /**
- * Visual variants. Each is a different silhouette, not a recolour: helmet vs
- * wrapped head, full plate vs chest rig, carbine vs long rifle.
- *
- * The three tints are hue shifts at roughly unit luminance — value is set per
- * part by the table above, so a variant can change colour family without
- * dragging every piece of its kit out of the albedo budget.
- *
- * THESE THREE ARE FROZEN. They are what the pixel gate and the albedo audit are
- * calibrated against. Faction kits are added alongside them from
- * `factionKits.js` and are distinguished by carrying `kit: true`.
+ * The three reference silhouettes. FROZEN: they are what the pixel gate and the
+ * albedo audit are calibrated against. Faction kits are merged in from
+ * `factionKits.js` below and are distinguished by carrying `kit: true`.
  */
 export const LEGACY_VARIANTS = {
   vanguard: {
@@ -208,12 +198,7 @@ export const LEGACY_VARIANTS = {
   },
 }
 
-/**
- * Every variant `buildSoldier` can be asked for: the three reference
- * silhouettes plus the faction kits. An unknown name still falls back to
- * `vanguard`, so a host that asks for something this build has never heard of
- * gets a soldier rather than an exception.
- */
+/** Every variant `buildSoldier` can be asked for. */
 export const VARIANTS = { ...LEGACY_VARIANTS, ...FACTION_KITS }
 
 export { KITS_BY_FACTION }
@@ -228,41 +213,63 @@ const bp = (name) => {
 }
 
 /**
+ * Resolve a variant name. A host that knows only the faction gets that
+ * faction's first kit rather than a tan PMC, and anything genuinely unknown
+ * still falls back to `vanguard` — a wrong-looking soldier beats an exception
+ * mid-raid.
+ */
+function resolveVariant(name, faction) {
+  if (VARIANTS[name]) return { key: name, V: VARIANTS[name] }
+  const pool = faction ? KITS_BY_FACTION[faction] : null
+  if (pool && pool.length && VARIANTS[pool[0]]) return { key: pool[0], V: VARIANTS[pool[0]] }
+  return { key: 'vanguard', V: VARIANTS.vanguard }
+}
+
+/**
  * Build one variant.
  *
  * @param name  variant key: a legacy silhouette or a faction kit
  * @param opts.rng         deterministic Rng
  * @param opts.materials   live SoldierMaterials
- * @param opts.faction     'scav' | 'raider' | 'pmc' | 'boss', advisory only —
- *                         the kit record is the authority
- * @param opts.subtype     archetype subtype id, for hue selection
+ * @param opts.faction     'scav' | 'raider' | 'pmc' | 'boss'. Only used to
+ *                         resolve an unknown variant name; the kit record is
+ *                         the authority once one is found.
+ * @param opts.subtype     archetype subtype id. Recorded on the result but it
+ *                         does NOT branch geometry or materials: both are cached
+ *                         per variant name by the host and prewarmed before any
+ *                         actor exists, so a per-instance branch here would hand
+ *                         out a material whose program was never compiled.
  * @param opts.armorZones  the zones this actor actually rolled armour on. An
  *                         empty array on a civilian kit means NO armour mesh.
  * @returns { geometry, materials: THREE.Material[], weapon, stats }
  */
 export function buildSoldier(name, { rng, materials, faction, subtype, armorZones } = {}) {
-  const V = VARIANTS[name] ?? VARIANTS.vanguard
+  const resolved = resolveVariant(name, faction)
+  const V = resolved.V
   const nz = new Noise(rng.fork())
   const B = new CharacterBuilder(RIG, { noise: nz, materials: MATERIALS })
 
   /* ---------------- what this actor is wearing ------------------------ */
 
   const civ = V.civ === true
-  // null = the caller did not say, so trust the kit; an array = the actor's
-  // real roll, and an empty one is a hard "no armour"
+  // null = the caller did not say, so trust the kit. An array = the actor's real
+  // roll, and an empty one is a hard "no armour".
   const rolled = Array.isArray(armorZones) ? armorZones.length > 0 : null
   /**
-   * THE SCAV ARMOUR GATE. A civilian kit shows exactly one piece of armour, a
-   * PACA soft vest, and only when the actor rolled a plate. `scav_paca` is the
-   * variant `agent.js` asks for when `_armorZones` came back non-empty, and the
-   * `rolled === true` arm catches the case where some other host built a
-   * civilian kit for an actor that did roll one.
+   * THE SCAV ARMOUR GATE. A civilian kit shows exactly one piece of armour — a
+   * PACA soft vest — and only when the actor rolled a plate. `scav_paca` is the
+   * variant `agent.js` asks for when `_armorZones` came back non-empty; the
+   * `civ && rolled` arm covers a host that built a plain civilian kit for an
+   * actor that did roll one, and `rolled === false` removes it outright.
    */
-  const showPaca = (civ || V.paca === true) && (rolled === null ? V.paca === true : rolled || V.paca === true)
+  const showPaca = rolled === false ? false : V.paca === true || (civ && rolled === true)
   const showCarrier = V.noCarrier !== true
   const heavy = V.heavyCarrier === true
   const armRadii = V.armRadii ?? ARM_RADII
   const legRadii = V.legRadii ?? LEG_RADII
+  // tracksuit bodies are darkened so their stripes can ride the material tint
+  const bodyColour = V.stripes && civ ? KIT_COLOUR.trackBody : [1, 1, 1]
+  const legColour = civ && V.cuffs === 'jean' ? KIT_COLOUR.jeans : [0.98, 0.98, 0.97]
 
   const shR = bp('UpperArmR'), elR = bp('ForearmR'), wrR = bp('HandR')
   const shL = bp('UpperArmL'), elL = bp('ForearmL'), wrL = bp('HandL')
@@ -309,14 +316,12 @@ export function buildSoldier(name, { rng, materials, faction, subtype, armorZone
     }
   }
   if (V.coat) {
-    // an open coat shades the torso it hangs off, and the inside of its own
-    // front flaps
+    // an open coat shades the torso it hangs off and the inside of its own flaps
     B.occlude([-0.09, 0.75, 0.09], [-0.09, 1.24, 0.11], 0.06, 0.9)
     B.occlude([0.09, 0.75, 0.09], [0.09, 1.24, 0.11], 0.06, 0.9)
   }
 
   /* ---------------- uniform ------------------------------------------ */
-  const bodyColour = V.stripes && civ ? KIT_COLOUR.trackBody : [1, 1, 1]
   B.add(P.jacketTorso(nz, { bulk: V.bulk, flare: V.flare ?? 1 }), {
     material: 'cloth',
     bones: ['Hips', 'Spine', 'Spine1', 'Spine2', 'Neck', 'ClavicleR', 'ClavicleL', 'UpperArmR', 'UpperArmL'],
@@ -332,7 +337,7 @@ export function buildSoldier(name, { rng, materials, faction, subtype, armorZone
     material: 'cloth',
     bones: ['Hips', 'Spine', 'UpLegR', 'UpLegL'],
     bias: [1, 0.7, 0.5, 0.5],
-    colour: civ && V.cuffs === 'jean' ? KIT_COLOUR.jeans : [0.97, 0.97, 0.97],
+    colour: civ ? legColour : [0.97, 0.97, 0.97],
     grime: 0.9,
     dirt: 0.35,
     dust: 0.2,
@@ -348,7 +353,7 @@ export function buildSoldier(name, { rng, materials, faction, subtype, armorZone
     name: 'collar',
   })
 
-  /* ---------------- civilian layers ---------------------------------- */
+  /* ---------------- civilian / boss outer layers ---------------------- */
   if (V.placket) {
     const j = F.jacketPlacket(nz, {})
     B.add(j.placket, {
@@ -399,7 +404,7 @@ export function buildSoldier(name, { rng, materials, faction, subtype, armorZone
   }
   if (V.pockets) {
     for (const side of [-1, 1]) {
-      B.add(F.chestPocket(nz, side * 0.086, 1.256, 0.116, side, 1), {
+      B.add(F.chestPocket(nz, side * 0.086, 1.256, 0.114, side, 1), {
         material: 'cloth',
         bones: ['Spine1', 'Spine2'],
         bias: [1, 0.8],
@@ -455,6 +460,8 @@ export function buildSoldier(name, { rng, materials, faction, subtype, armorZone
       name: `shoulder${suffix}`,
     })
     const armChain = [[sh[0] + side * 0.012, sh[1] + 0.055, sh[2]], el, wr]
+    const armBones = [`Clavicle${suffix}`, `UpperArm${suffix}`, `Forearm${suffix}`, `Hand${suffix}`, 'Spine2']
+    const armBias = [0.5, 1, 1, 0.7, 0.25]
     B.add(
       P.limbTube(nz, armChain[0], armChain[1], armChain[2], armRadii, {
         rings: 22,
@@ -467,8 +474,8 @@ export function buildSoldier(name, { rng, materials, faction, subtype, armorZone
       }),
       {
         material: 'cloth',
-        bones: [`Clavicle${suffix}`, `UpperArm${suffix}`, `Forearm${suffix}`, `Hand${suffix}`, 'Spine2'],
-        bias: [0.5, 1, 1, 0.7, 0.25],
+        bones: armBones,
+        bias: armBias,
         colour: bodyColour,
         grime: 0.8,
         dirt: 0.15,
@@ -477,4 +484,925 @@ export function buildSoldier(name, { rng, materials, faction, subtype, armorZone
         name: `sleeve${suffix}`,
       }
     )
-    // THREE-STRIPE TRACKSUI
+    // THREE-STRIPE TRACKSUIT RIBBONS down the outer face of the arm. The stripes
+    // ride the material tint at full vertex colour while the sleeve under them is
+    // darkened, which is the only way to get white-on-dark out of one material.
+    if (V.stripes) {
+      B.add(
+        F.trackStripes(armChain, {
+          out: [side, 0, 0],
+          lateral: [0, 0, 1],
+          radius: [armRadii[0], armRadii[3], armRadii[6]],
+          count: 3,
+          gap: 0.017,
+          width: 0.011,
+          thick: 0.0035,
+          lift: 0.0015,
+        }),
+        {
+          material: 'cloth',
+          bones: armBones,
+          bias: armBias,
+          colour: KIT_COLOUR.trackStripe,
+          grime: 0.5,
+          dirt: 0.1,
+          dust: 0.35,
+          wear: 0.1,
+          name: `armStripe${suffix}`,
+        }
+      )
+    }
+    // elbow reinforcement patch — issued kit only
+    if (!civ) {
+      B.add(
+        P.limbTube(
+          nz,
+          [el[0] * 0.98 + sh[0] * 0.02, el[1] + 0.05, el[2] - 0.005],
+          el,
+          [el[0] * 0.98 + wr[0] * 0.02, el[1] - 0.05, el[2] + 0.004],
+          [0.050, 0.054, 0.050],
+          { rings: 5, seg: 14, fold: 0.001 }
+        ),
+        {
+          material: 'gear',
+          bones: [`UpperArm${suffix}`, `Forearm${suffix}`],
+          bias: [1, 1],
+          colour: GEAR.pad,
+          grime: 1.0,
+          dirt: 0.25,
+          dust: 0.22,
+          wear: 0.16,
+          name: `elbowPad${suffix}`,
+        }
+      )
+    } else if (V.patches) {
+      // a mismatched repair instead: the fastest way to say "not issued"
+      B.add(F.clothPatch(nz, [el[0] + side * 0.044, el[1] + 0.004, el[2] - 0.016], [side, 0.1, -0.3], 0.046), {
+        material: 'cloth',
+        bones: [`UpperArm${suffix}`, `Forearm${suffix}`],
+        bias: [1, 1],
+        colour: KIT_COLOUR.patch,
+        grime: 1.0,
+        dirt: 0.4,
+        dust: 0.3,
+        wear: 0.3,
+        name: `elbowPatch${suffix}`,
+      })
+    }
+  }
+
+  /**
+   * Scav bandolier. Also the part that keeps `gear` ahead of `boot` in the
+   * material order for civilian kits, which have no elbow pads — see
+   * MATERIAL_SLOTS.
+   */
+  if (V.bandolier) {
+    B.add(F.bandolier(nz, V.bandolier), {
+      material: 'gear',
+      bones: ['Spine2', 'Spine1', 'Spine', 'ClavicleR', 'ClavicleL'],
+      bias: [1, 0.9, 0.6, 0.5, 0.5],
+      colour: KIT_COLOUR.civStrap,
+      grime: 1.0,
+      dirt: 0.5,
+      dust: 0.45,
+      wear: 0.34,
+      name: 'bandolier',
+    })
+  }
+
+  /* ---------------- trousers, boots ---------------------------------- */
+  for (const [hip, kn, an, suffix] of [
+    [hipR, knR, anR, 'R'],
+    [hipL, knL, anL, 'L'],
+  ]) {
+    const side = suffix === 'R' ? -1 : 1
+    const legChain = [hip, kn, [an[0], an[1] + 0.085, an[2] + 0.008]]
+    const legBones = ['Hips', `UpLeg${suffix}`, `Leg${suffix}`, `Foot${suffix}`]
+    const legBias = [0.6, 1, 1, 0.5]
+    B.add(
+      P.limbTube(nz, legChain[0], legChain[1], legChain[2], legRadii, {
+        rings: 24,
+        seg: 17,
+        fold: 0.0018,
+        // trousers crease harder than sleeves and stack on the boot cuff
+        crease: civ ? 0.005 : 0.0042,
+        bend: [0, 0, -1], // gathers behind the knee
+      }),
+      {
+        material: 'cloth',
+        bones: legBones,
+        bias: legBias,
+        colour: legColour,
+        grime: 0.8,
+        dirt: civ ? 0.85 : 0.72,
+        dust: 0.22,
+        wear: civ ? 0.22 : 0.10,
+        name: `leg${suffix}`,
+      }
+    )
+    if (V.stripes) {
+      B.add(
+        F.trackStripes(legChain, {
+          out: [side, 0, 0],
+          lateral: [0, 0, 1],
+          radius: [legRadii[0], legRadii[3], legRadii[6]],
+          count: 3,
+          gap: 0.019,
+          width: 0.013,
+          thick: 0.004,
+          lift: 0.0015,
+        }),
+        {
+          material: 'cloth',
+          bones: legBones,
+          bias: legBias,
+          colour: KIT_COLOUR.trackStripe,
+          grime: 0.6,
+          dirt: 0.2,
+          dust: 0.35,
+          wear: 0.12,
+          name: `legStripe${suffix}`,
+        }
+      )
+    }
+    // cargo pocket on the outer thigh — issued trousers only
+    if (!civ) {
+      B.add(
+        P.pouch(nz, {
+          hx: 0.052, hy: 0.070, hz: 0.026,
+          x: hip[0] + side * 0.062, y: hip[1] - 0.16, z: 0.026,
+          rz: side * 0.06, ry: side * 0.55, bend: 0.11,
+        }),
+        {
+          material: 'cloth',
+          bones: [`UpLeg${suffix}`, 'Hips'],
+          bias: [1, 0.4],
+          colour: [0.95, 0.95, 0.94],
+          grime: 0.9,
+          dirt: 0.5,
+          dust: 0.4,
+          wear: 0.16,
+          name: `cargo${suffix}`,
+        }
+      )
+    }
+    if (V.kneePads) {
+      B.add(P.kneePad(nz, kn, side), {
+        material: 'gear',
+        bones: [`Leg${suffix}`, `UpLeg${suffix}`],
+        bias: [1, 0.5],
+        colour: GEAR.pad,
+        grime: 1.0,
+        dirt: 0.9,
+        dust: 0.28,
+        wear: 0.20,
+        name: `knee${suffix}`,
+      })
+    }
+    // boots
+    B.add(P.boot(nz, an, side), {
+      material: 'boot',
+      bones: [`Leg${suffix}`, `Foot${suffix}`, `Toe${suffix}`],
+      bias: [0.55, 1, 0.6],
+      colour: GEAR.boot,
+      grime: 0.9,
+      dirt: 0.85,
+      dust: 0.5,
+      wear: 0.3,
+      name: `boot${suffix}`,
+    })
+    B.add(P.bootSole(an), {
+      material: 'rubber',
+      bones: [`Foot${suffix}`, `Toe${suffix}`],
+      bias: [1, 0.8],
+      grime: 0.9,
+      dirt: 1.0,
+      name: `sole${suffix}`,
+    })
+    B.add(P.bootLaces(an), {
+      material: 'boot',
+      bone: `Foot${suffix}`,
+      colour: GEAR.lace,
+      grime: 0.9,
+      dirt: 0.85,
+      name: `laces${suffix}`,
+    })
+    // Civilian trousers do not blouse into the boot: jeans STACK on the laces,
+    // tracksuit hems grip the ankle. Either one breaks the clean combat-trouser
+    // line that reads as issued kit.
+    if (V.cuffs === 'jean') {
+      B.add(F.jeanCuffs(nz, an, side), {
+        material: 'cloth',
+        bones: [`Leg${suffix}`, `Foot${suffix}`],
+        bias: [1, 0.55],
+        colour: KIT_COLOUR.jeans,
+        grime: 1.0,
+        dirt: 0.95,
+        dust: 0.4,
+        wear: 0.34,
+        name: `jeanCuff${suffix}`,
+      })
+    } else if (V.cuffs === 'track') {
+      B.add(F.trackCuffs(nz, an), {
+        material: 'cloth',
+        bones: [`Leg${suffix}`, `Foot${suffix}`],
+        bias: [1, 0.55],
+        colour: bodyColour,
+        grime: 1.0,
+        dirt: 0.9,
+        dust: 0.4,
+        wear: 0.28,
+        name: `trackCuff${suffix}`,
+      })
+    }
+  }
+
+  /* ---------------- armour ------------------------------------------- */
+  const carrierBones = ['Spine', 'Spine1', 'Spine2', 'ClavicleR', 'ClavicleL']
+  const carrierBias = [0.7, 1, 1, 0.45, 0.45]
+
+  if (showPaca) {
+    // SOFT ARMOUR ONLY: two thin panels and a shoulder yoke, no cummerbund and
+    // no PALS. See factionParts.pacaVest — the moment it grows hardware it stops
+    // reading as a scav who found a vest.
+    B.add(F.pacaVest(nz, {}), {
+      material: 'plate',
+      bones: carrierBones,
+      bias: carrierBias,
+      colour: KIT_COLOUR.paca,
+      grime: 1.0,
+      dirt: 0.5,
+      dust: 0.4,
+      wear: 0.34,
+      name: 'paca',
+    })
+  } else if (showCarrier && heavy) {
+    const hc = F.heavyCarrier(nz, {})
+    B.add(hc.plates, {
+      material: 'plate',
+      bones: carrierBones,
+      bias: carrierBias,
+      colour: KIT_COLOUR.carrier,
+      grime: 0.85,
+      dirt: 0.3,
+      dust: 0.3,
+      wear: 0.2,
+      name: 'carrier',
+    })
+    // pauldrons square off the shoulder line — the raider's silhouette cue, and
+    // the reason they read as armoured before the tint is even visible
+    B.add(hc.pauldrons, {
+      material: 'plate',
+      bones: ['ClavicleR', 'ClavicleL', 'Spine2', 'UpperArmR', 'UpperArmL'],
+      bias: [1, 1, 0.6, 0.35, 0.35],
+      colour: KIT_COLOUR.pauldron,
+      grime: 0.8,
+      dirt: 0.25,
+      dust: 0.45,
+      wear: 0.3,
+      name: 'pauldrons',
+    })
+    B.add(hc.webbing, {
+      material: 'gear',
+      bones: ['Spine1', 'Spine2'],
+      bias: [1, 1],
+      colour: GEAR.webbing,
+      grime: 1.0,
+      dust: 0.3,
+      wear: 0.26,
+      name: 'webbing',
+    })
+  } else if (showCarrier) {
+    B.add(P.plateCarrier(nz, V), {
+      material: 'plate',
+      bones: carrierBones,
+      bias: carrierBias,
+      colour: [0.72, 0.72, 0.72],
+      grime: 0.85,
+      dirt: 0.3,
+      dust: 0.30,
+      wear: 0.18,
+      name: 'carrier',
+    })
+    B.add(P.carrierWebbing(), {
+      material: 'gear',
+      bones: ['Spine1', 'Spine2'],
+      bias: [1, 1],
+      colour: GEAR.webbing,
+      grime: 1.0,
+      dust: 0.3,
+      wear: 0.26,
+      name: 'webbing',
+    })
+  }
+
+  /* ---------------- load-bearing gear -------------------------------- */
+  if (showCarrier) {
+    // magazine pouches across the front, deliberately not evenly loaded
+    const nPouch = V.fullCarrier ? 3 : 2
+    for (let i = 0; i < nPouch; i++) {
+      const t = nPouch === 1 ? 0.5 : i / (nPouch - 1)
+      const x = (t - 0.5) * (nPouch > 2 ? 0.156 : 0.09)
+      B.add(
+        P.pouch(nz, {
+          hx: 0.033, hy: 0.056, hz: 0.034,
+          x, y: 1.236 + rng.range(-0.006, 0.006), z: heavy ? 0.156 : 0.148,
+          rx: -0.10, rz: rng.range(-0.05, 0.05),
+          lidTilt: i === 1 ? -0.5 : 0,
+          bend: 0.26,
+        }),
+        {
+          material: 'gear',
+          bones: ['Spine1', 'Spine2', 'Spine'],
+          bias: [1, 0.8, 0.4],
+          colour: i === 1 ? GEAR.pouchAlt : GEAR.pouch,
+          grime: 0.9,
+          dirt: 0.25,
+          dust: 0.5,
+          wear: 0.30,
+          name: `magPouch${i}`,
+        }
+      )
+      // a magazine sticking out of the open pouch
+      if (i === 1) {
+        const mag = P.pouch(nz, {
+          hx: 0.0145, hy: 0.042, hz: 0.023,
+          x, y: 1.308, z: heavy ? 0.160 : 0.152, rx: -0.12,
+        })
+        B.add(mag, {
+          material: 'polymer',
+          bones: ['Spine1', 'Spine2'],
+          bias: [1, 0.8],
+          grime: 0.4,
+          wear: 0.2,
+          name: 'spareMag',
+        })
+      }
+    }
+
+    // radio on the left chest, admin pouch on the right
+    B.add(
+      P.pouch(nz, {
+        hx: 0.032, hy: 0.058, hz: 0.028,
+        x: 0.112, y: 1.336, z: 0.118, ry: 0.35, rz: 0.10, bend: 0.24,
+      }),
+      {
+        material: 'gear',
+        bones: ['Spine2', 'ClavicleL', 'Spine1'],
+        bias: [1, 0.5, 0.5],
+        colour: GEAR.pouchAlt,
+        grime: 0.9,
+        dust: 0.5,
+        wear: 0.22,
+        name: 'radio',
+      }
+    )
+    const ant = P.pouch(nz, { hx: 0.005, hy: 0.075, hz: 0.005, x: 0.116, y: 1.424, z: 0.104, rx: -0.18 })
+    B.add(ant, {
+      material: 'polymer',
+      bones: ['Spine2', 'ClavicleL'],
+      bias: [1, 0.6],
+      grime: 0.3,
+      name: 'antenna',
+    })
+  }
+
+  B.add(P.belt(nz), {
+    material: 'gear',
+    bones: ['Hips', 'Spine'],
+    bias: [1, 0.5],
+    colour: civ ? KIT_COLOUR.civStrap : GEAR.belt,
+    grime: 1.0,
+    dirt: 0.4,
+    dust: 0.25,
+    wear: 0.26,
+    name: 'belt',
+  })
+  /**
+   * Belt buckle. Also the `polymer` part that keeps polymer ahead of `skin` for
+   * kits with no magazine pouches and therefore no spare magazine — see
+   * MATERIAL_SLOTS. Gated so the reference variants are unchanged.
+   */
+  if (V.buckle) {
+    B.add(P.pouch(nz, { hx: 0.030, hy: 0.021, hz: 0.010, x: 0, y: 0.902, z: 0.116, bend: 0.20 }), {
+      material: 'polymer',
+      bones: ['Hips', 'Spine'],
+      bias: [1, 0.4],
+      grime: 0.6,
+      dust: 0.3,
+      wear: 0.35,
+      name: 'buckle',
+    })
+  }
+  B.add(P.hipPouch(nz, -1), {
+    material: 'gear',
+    bones: ['Hips', 'Spine'],
+    bias: [1, 0.4],
+    colour: civ ? KIT_COLOUR.civStrap : GEAR.dump,
+    grime: 0.95,
+    dirt: 0.6,
+    dust: 0.45,
+    wear: 0.26,
+    name: 'dumpPouch',
+  })
+
+  /* ---------------- head --------------------------------------------- */
+  const wrapped = V.faceWrap
+  B.add(P.headMesh(nz, head, {}), {
+    material: 'skin',
+    bone: 'Head',
+    colour: [1, 1, 1],
+    grime: civ ? 0.55 : 0.3,
+    dirt: civ ? 0.2 : 0.06,
+    name: 'head',
+  })
+  B.add(P.nose(nz, head), { material: 'skin', bone: 'Head', grime: 0.25, name: 'nose' })
+  B.add(P.ear(nz, head, -1), { material: 'skin', bone: 'Head', grime: 0.45, name: 'earR' })
+  B.add(P.ear(nz, head, 1), { material: 'skin', bone: 'Head', grime: 0.45, name: 'earL' })
+  for (const side of [-1, 1]) {
+    B.add(P.eyeball(head, side), {
+      material: 'polymer',
+      bone: 'Head',
+      colour: [0.55, 0.5, 0.45],
+      grime: 0.2,
+      name: 'eye',
+    })
+  }
+  // neck
+  B.add(
+    P.limbTube(nz, [head[0], head[1] - 0.10, head[2] - 0.012], [head[0], head[1] - 0.05, head[2] - 0.008], [head[0], head[1], head[2]],
+      [0.058, 0.056, 0.054], { rings: 5, seg: 14, fold: 0.001 }),
+    {
+      material: 'skin',
+      bones: ['Neck', 'Head', 'Spine2'],
+      bias: [1, 0.7, 0.4],
+      grime: 0.5,
+      name: 'neck',
+    }
+  )
+
+  if (wrapped) {
+    // A hard ballistic mask is moulded polymer on the *same* geometry: the seam
+    // and the bridge fold read as the mask's edge and nose vent instead of a
+    // cloth hem, and it lands far darker than any cloth in the kit, which is
+    // what gives that variant a legible face at range.
+    B.add(P.faceWrap(nz, head, V), {
+      material: V.maskHard ? 'polymer' : 'gear',
+      bones: ['Head', 'Neck'],
+      bias: [1, 0.5],
+      colour: V.maskHard ? GEAR.mask : V.helmet ? GEAR.wrap : [0.78, 0.74, 0.66],
+      grime: V.maskHard ? 0.5 : 0.85,
+      dirt: V.maskHard ? 0.1 : 0.2,
+      dust: V.maskHard ? 0.2 : 0.3,
+      wear: V.maskHard ? 0.3 : 0.1,
+      name: 'faceWrap',
+    })
+  }
+
+  if (V.killa) {
+    /**
+     * KILLA. A blunt Maska shell with the three raised crown stripes, and a
+     * faceplate that covers the whole face rather than the eye line. The
+     * stripes ride the bright `plateTint` at near-full vertex colour while the
+     * shell is pulled down to a carrier value, so one material yields a dark
+     * helmet with pale stripes.
+     */
+    const k = F.killaHelmet(nz, head, {})
+    B.add(k.shell, {
+      material: 'plate',
+      bone: 'Head',
+      colour: KIT_COLOUR.killaShell,
+      grime: 0.8,
+      dirt: 0.3,
+      dust: 0.4,
+      wear: 0.45,
+      name: 'killaShell',
+    })
+    B.add(k.stripes, {
+      material: 'plate',
+      bone: 'Head',
+      colour: KIT_COLOUR.killaStripe,
+      grime: 0.45,
+      dirt: 0.1,
+      dust: 0.3,
+      wear: 0.25,
+      name: 'killaStripes',
+    })
+    B.add(k.visor, { material: 'glass', bone: 'Head', colour: [1, 1, 1], grime: 0.2, name: 'killaVisor' })
+    B.add(P.chinStrap(head), {
+      material: 'gear',
+      bones: ['Head', 'Neck'],
+      bias: [1, 0.4],
+      colour: GEAR.strap,
+      grime: 0.95,
+      dust: 0.25,
+      wear: 0.18,
+      name: 'chinStrap',
+    })
+  } else if (V.visorHelmet) {
+    // RAIDER. Full-cut shell that comes down over the ears, ear cups, a mandible
+    // bar and a flip-down visor — an assaulter, not a soldier in a high-cut.
+    const h = F.visorHelmet(nz, head, { visorUp: V.visorUp })
+    B.add(h.shell, {
+      material: 'plate',
+      bone: 'Head',
+      colour: KIT_COLOUR.raiderShell,
+      grime: 0.7,
+      dirt: 0.2,
+      dust: 0.5,
+      wear: 0.4,
+      name: 'helmet',
+    })
+    B.add(h.mandible, {
+      material: 'plate',
+      bones: ['Head', 'Neck'],
+      bias: [1, 0.3],
+      colour: KIT_COLOUR.raiderShell,
+      grime: 0.75,
+      dust: 0.35,
+      wear: 0.35,
+      name: 'mandible',
+    })
+    B.add(h.cups, { material: 'polymer', bone: 'Head', grime: 0.5, wear: 0.3, name: 'helmetHW' })
+    B.add(h.visor, { material: 'glass', bone: 'Head', colour: [1, 1, 1], grime: 0.18, name: 'visor' })
+    B.add(P.chinStrap(head), {
+      material: 'gear',
+      bones: ['Head', 'Neck'],
+      bias: [1, 0.4],
+      colour: GEAR.strap,
+      grime: 0.95,
+      dust: 0.25,
+      wear: 0.18,
+      name: 'chinStrap',
+    })
+  } else if (V.helmet) {
+    // A covered helmet is CLOTH, not plastic: the camo cover is the single
+    // biggest reason a helmet reads as a helmet rather than a bowling ball. Its
+    // tint deliberately lands off the uniform value so the head separates from
+    // the torso at range. A bare shell goes on the laminate set instead.
+    B.add(P.helmet(nz, head, V), {
+      material: V.helmetCover ? 'cloth' : 'plate',
+      bone: 'Head',
+      colour: V.helmetTint ?? [1, 1, 1],
+      grime: 0.6,
+      dirt: 0.2,
+      dust: 0.55,
+      wear: 0.4,
+      name: 'helmet',
+    })
+    B.add(P.helmetHardware(nz, head), {
+      material: 'polymer',
+      bone: 'Head',
+      grime: 0.5,
+      wear: 0.3,
+      name: 'helmetHW',
+    })
+    B.add(P.chinStrap(head), {
+      material: 'gear',
+      bones: ['Head', 'Neck'],
+      bias: [1, 0.4],
+      colour: GEAR.strap,
+      grime: 0.95,
+      dust: 0.25,
+      wear: 0.18,
+      name: 'chinStrap',
+    })
+    if (V.goggles) {
+      const g = P.goggles(head, V.gogglesDown)
+      B.add(g.frame, { material: 'polymer', bone: 'Head', grime: 0.4, wear: 0.35, name: 'goggleFrame' })
+      B.add(g.strap, {
+        material: 'gear',
+        bone: 'Head',
+        colour: GEAR.strap,
+        grime: 0.85,
+        dust: 0.3,
+        name: 'goggleStrap',
+      })
+      B.add(P.goggleLens(head, V.gogglesDown), {
+        material: 'glass',
+        bone: 'Head',
+        colour: [1, 1, 1],
+        grime: 0.15,
+        name: 'goggleLens',
+      })
+    }
+  } else if (V.headgear === 'ushanka') {
+    // The single most legible "not a soldier" cue available: fur, and a
+    // silhouette wider than the skull.
+    const h = F.ushanka(nz, head, { flapsUp: V.flapsUp })
+    B.add(h.crown, {
+      material: 'cloth',
+      bone: 'Head',
+      colour: KIT_COLOUR.hat,
+      grime: 0.9,
+      dirt: 0.3,
+      dust: 0.5,
+      wear: 0.2,
+      name: 'ushanka',
+    })
+    B.add(h.fur, {
+      material: 'cloth',
+      bone: 'Head',
+      colour: KIT_COLOUR.fur,
+      grime: 1.0,
+      dirt: 0.45,
+      dust: 0.55,
+      wear: 0.3,
+      name: 'ushankaFur',
+    })
+    B.add(h.flaps, {
+      material: 'cloth',
+      bones: ['Head', 'Neck'],
+      bias: [1, 0.3],
+      colour: KIT_COLOUR.fur,
+      grime: 1.0,
+      dirt: 0.4,
+      dust: 0.5,
+      wear: 0.28,
+      name: 'ushankaFlaps',
+    })
+  } else if (V.headgear === 'beanie') {
+    B.add(F.beanie(nz, head, { bobble: V.bobble }), {
+      material: 'cloth',
+      bone: 'Head',
+      colour: KIT_COLOUR.hat,
+      grime: 1.0,
+      dirt: 0.35,
+      dust: 0.5,
+      wear: 0.26,
+      name: 'beanie',
+    })
+  } else if (V.headgear === 'cap') {
+    const c = F.civCap(nz, head, { flat: V.flatCap })
+    B.add(c.crown, {
+      material: 'cloth',
+      bone: 'Head',
+      colour: KIT_COLOUR.hat,
+      grime: 0.95,
+      dirt: 0.3,
+      dust: 0.5,
+      wear: 0.24,
+      name: 'cap',
+    })
+    // the peak is the whole point: a hard horizontal shadow across the brow
+    B.add(c.peak, {
+      material: 'cloth',
+      bone: 'Head',
+      colour: KIT_COLOUR.seam,
+      grime: 0.9,
+      dirt: 0.25,
+      dust: 0.4,
+      wear: 0.3,
+      name: 'capPeak',
+    })
+  } else if (V.headWrap) {
+    B.add(P.headScarf(nz, head), {
+      // hue comes from the variant's cloth tint; the VALUE sits below the uniform
+      // so the head is never the brightest thing on the figure
+      material: 'cloth',
+      bone: 'Head',
+      colour: [0.82, 0.80, 0.76],
+      grime: 0.8,
+      dirt: 0.25,
+      dust: 0.4,
+      wear: 0.14,
+      name: 'shemagh',
+    })
+  }
+
+  if (V.shades) {
+    const s = P.sunglasses(head)
+    B.add(s.frame, { material: 'polymer', bone: 'Head', grime: 0.4, wear: 0.3, name: 'shadeFrame' })
+    B.add(s.lens, {
+      material: 'glass',
+      bone: 'Head',
+      colour: [1, 1, 1],
+      grime: 0.2,
+      name: 'shadeLens',
+    })
+  }
+
+  /* ---------------- hands + weapon ----------------------------------- */
+  const bore = new THREE.Vector3(...BORE_DIR).normalize()
+  const palmR = new THREE.Vector3(-0.55, 0.35, -0.75).normalize()
+  const palmL = new THREE.Vector3(0.75, 0.30, -0.60).normalize()
+  const gripAxisR = new THREE.Vector3(0.18, 0.92, -0.34).normalize() // down the grip
+  const gripAxisL = bore.clone()
+  const gloveColour = civ ? KIT_COLOUR.civGlove : GEAR.glove
+
+  B.add(P.glove(nz, wrR, [gripAxisR.x, gripAxisR.y, gripAxisR.z], [palmR.x, palmR.y, palmR.z], -1), {
+    material: 'boot',
+    bones: ['HandR', 'ForearmR'],
+    bias: [1, 0.35],
+    colour: gloveColour,
+    grime: 0.9,
+    dirt: 0.3,
+    dust: 0.25,
+    wear: 0.28,
+    name: 'gloveR',
+  })
+  B.add(P.glove(nz, wrL, [gripAxisL.x, gripAxisL.y, gripAxisL.z], [palmL.x, palmL.y, palmL.z], 1), {
+    material: 'boot',
+    bones: ['HandL', 'ForearmL'],
+    bias: [1, 0.35],
+    colour: gloveColour,
+    grime: 0.9,
+    dirt: 0.3,
+    dust: 0.25,
+    wear: 0.28,
+    name: 'gloveL',
+  })
+  // Hard knuckle guards are issued kit. A scav gets bare gloves, which is one
+  // more silhouette difference at the hands.
+  if (!civ) {
+    B.add(P.knuckleGuard(wrR, [gripAxisR.x, gripAxisR.y, gripAxisR.z], [palmR.x, palmR.y, palmR.z]), {
+      material: 'polymer',
+      bone: 'HandR',
+      grime: 0.5,
+      wear: 0.35,
+      name: 'knuckleR',
+    })
+    B.add(P.knuckleGuard(wrL, [gripAxisL.x, gripAxisL.y, gripAxisL.z], [palmL.x, palmL.y, palmL.z]), {
+      material: 'polymer',
+      bone: 'HandL',
+      grime: 0.5,
+      wear: 0.35,
+      name: 'knuckleL',
+    })
+  }
+
+  const W = buildWeapon(nz, V.weapon, rng)
+  // Optic glass BEFORE the steel: for a kit with no goggles, visor or shades
+  // this is where `glass` first appears, and it has to land ahead of `steel` to
+  // hold MATERIAL_SLOTS. The legacy variants already registered glass on the
+  // head, so their material order does not move.
+  if (W.glass.p.length) {
+    B.add(W.glass, { material: 'glass', bone: 'HandR', grime: 0.1, name: 'wpnGlass' })
+  }
+  B.add(W.steel, { material: 'steel', bone: 'HandR', grime: 0.55, wear: 0.25, name: 'wpnSteel' })
+  B.add(W.polymer, { material: 'polymer', bone: 'HandR', grime: 0.5, wear: 0.3, name: 'wpnPoly' })
+  B.add(W.rubber, { material: 'rubber', bone: 'HandR', grime: 0.6, name: 'wpnRubber' })
+
+  // sling: body-bound so it stays on the chest as the arms move
+  B.add(P.sling(W.foregrip, W.stockTop), {
+    material: 'gear',
+    bones: ['Spine2', 'Spine1', 'ClavicleR', 'ClavicleL', 'Hips'],
+    bias: [1, 0.8, 0.5, 0.5, 0.3],
+    colour: civ ? KIT_COLOUR.civStrap : GEAR.sling,
+    grime: 1.0,
+    dust: 0.2,
+    wear: 0.22,
+    name: 'sling',
+  })
+
+  const built = B.build()
+  // Guard the prewarm contract: see MATERIAL_SLOTS.
+  if (built.materialNames.join() !== MATERIAL_SLOTS.filter((s) => built.materialNames.includes(s)).join()) {
+    console.warn(
+      `[ai] material slot order changed for "${resolved.key}" (${built.materialNames.join()}); ` +
+        'update MATERIAL_SLOTS or prewarmMaterials will reorder opaque draws'
+    )
+  }
+  const mats = resolveMaterials(resolved.key, built.materialNames, materials)
+
+  return {
+    geometry: built.geometry,
+    materials: mats,
+    parts: built.parts,
+    weapon: W,
+    stats: { vertices: built.vertices, triangles: built.triangles },
+    variant: V,
+    variantName: resolved.key,
+    faction: V.faction ?? faction ?? null,
+    subtype: subtype ?? null,
+    armoured: showPaca || (showCarrier && !civ),
+  }
+}
+
+/**
+ * Every material slot a soldier's geometry is grouped by, IN THE ORDER
+ * `CharacterBuilder.build()` emits them — which is the order the parts are added
+ * above, deduplicated.
+ *
+ * THE ORDER IS LOAD-BEARING, and this is not a style preference. `THREE.Material`
+ * hands out globally incrementing ids and three sorts the opaque render list by
+ * `material.id` (`painterSortStable`), including the groups *within* one soldier.
+ * Create them in a different order and the goggle lens draws before its frame
+ * instead of after it; with a depth prepass in front, whichever coplanar surface
+ * is drawn last wins the equal-depth test. MEASURED: prewarming these in a
+ * hand-written order moved 2 pixels of the `combat` shot by 1/255 and failed the
+ * pixel gate. `buildSoldier` asserts the order below still matches.
+ *
+ * A variant may use a SUBSET — an unarmoured scav has no `plate` group and a
+ * bare-headed one may have no `glass` — and the guard compares against the
+ * filtered list, so a subsequence is fine. What is never fine is a reordering,
+ * which is why the belt buckle (polymer) and the optic glass are added where
+ * they are.
+ */
+export const MATERIAL_SLOTS = Object.freeze([
+  'cloth', 'gear', 'boot', 'rubber', 'plate', 'polymer', 'skin', 'glass', 'steel',
+])
+
+/**
+ * Resolve a variant's material slot names to real materials.
+ *
+ * Split out of `buildSoldier` on purpose: `AiSystem.prewarmMaterials()` needs
+ * every material a variant will ever ask for so their shader programs can be
+ * compiled while a loading screen is up, and it must be able to get them WITHOUT
+ * building a single triangle (geometry construction draws from the shared RNG
+ * stream, so doing it early would move every downstream random draw and change
+ * the picture). `SoldierMaterials.get()` is a pure function of its key and opts,
+ * so calling it early is free of side effects.
+ *
+ * `detail` is the second half of the two-scale system: the base tile carries the
+ * macro camo and the garment seams, this tile carries the weave and the webbing
+ * ribbing. `scale` converts the base tile's UVs (metres / tile) into the detail
+ * tile's, so the physical size of a thread is identical on a sleeve, a pouch and
+ * a boot without any per-part tuning.
+ */
+export function resolveMaterials(name, slots, materials) {
+  const V = VARIANTS[name] ?? VARIANTS.vanguard
+  const detail = (set, matName, normal, rough) => ({
+    set,
+    scale: MATERIALS[matName].tile / DETAIL_TILE,
+    normal,
+    rough,
+  })
+  if (V.kit) return resolveKitMaterials(V, slots, materials, detail)
+  return slots.map((n) => {
+    switch (n) {
+      case 'cloth':
+        return materials.get(`camo_${V.camo}`, {
+          key: name,
+          tint: V.clothTint,
+          rough: ROUGH.cloth,
+          metal: 1,
+          // 1.15, not 1.0: the base tile now carries a 1-2 cm crease field and
+          // the folds have to actually catch the key light at 25 m.
+          normalScale: 1.15,
+          detail: detail('cloth', 'cloth', 0.45, 0.16),
+        })
+      case 'plate':
+        return materials.get('plate', {
+          key: name,
+          tint: V.plateTint,
+          rough: ROUGH.plate,
+          normalScale: 1.0,
+          detail: detail('nylon', 'plate', 0.45, 0.10),
+        })
+      case 'gear':
+        return materials.get('nylon', {
+          key: name,
+          tint: V.gearTint,
+          normalScale: 1.1,
+          detail: detail('nylon', 'gear', 0.5, 0.14),
+        })
+      case 'boot':
+        return materials.get('nylon', {
+          key: `${name}_boot`,
+          tint: V.gearTint,
+          rough: ROUGH.boot,
+          normalScale: 1.1,
+          detail: detail('nylon', 'boot', 0.5, 0.10),
+        })
+      case 'skin':
+        return materials.get('skin', { key: name, tint: V.skinTint, normalScale: 0.8, ao: 0.6 })
+      case 'polymer':
+        return materials.get('polymer', { key: name, normalScale: 1.0 })
+      case 'steel':
+        return materials.get('steel', { key: name, normalScale: 1.0 })
+      case 'rubber':
+        return materials.get('rubber', { key: name, normalScale: 1.2 })
+      case 'glass':
+        return materials.glass()
+      default:
+        return materials.get('polymer', { key: name })
+    }
+  })
+}
+
+/**
+ * Faction kits go through `materialSpecs`, which states each slot as intent —
+ * bake, tint, absolute roughness already divided by that bake's map average, and
+ * which detail tile to blend. The tile scale is applied here because the tile
+ * table lives in this file.
+ *
+ * The camo set in the spec has ALREADY been checked against `materials.sets`;
+ * `SoldierMaterials.get()` throws on a pattern the host never baked, and
+ * `camo_urban` in particular is absent unless the host asked for it.
+ */
+function resolveKitMaterials(V, slots, materials, detail) {
+  const spec = materialSpecs(V, materials)
+  return slots.map((n) => {
+    if (n === 'glass') return materials.glass()
+    const s = spec[n] ?? spec.polymer
+    const opts = { key: `${V.id}_${n}` }
+    if (s.tint) opts.tint = s.tint
+    if (s.rough !== undefined && s.rough !== null) opts.rough = s.rough
+    if (s.metal !== undefined) opts.metal = s.metal
+    if (s.normalScale !== undefined) opts.normalScale = s.normalScale
+    if (s.ao !== undefined) opts.ao = s.ao
+    if (s.detail) opts.detail = detail(s.detail.set, s.detail.tile, s.detail.normal, s.detail.rough)
+    return materials.get(s.set, opts)
+  })
+}
